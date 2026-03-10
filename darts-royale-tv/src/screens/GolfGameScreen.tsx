@@ -2387,7 +2387,7 @@ export default function GolfGameScreen({ route, navigation }: Props) {
         {scoreLabel(
           showFrontBackInTotalRow && front9DisplayTotals && back9DisplayTotals && currentPlayer.holeIndex >= 10
             ? (front9DisplayTotals[state.currentPlayerIndex] ?? 0) + (back9DisplayTotals[state.currentPlayerIndex] ?? 0)
-            : currentPlayer.total
+            : currentPlayer.total + (showNetScore && placementHandicapsFromSetup?.[state.currentPlayerIndex] != null ? (placementHandicapsFromSetup[state.currentPlayerIndex] ?? 0) : 0)
         )}
         {showFrontBackInTotalRow && front9DisplayTotals && back9DisplayTotals && currentPlayer.holeIndex >= 10 && (() => {
           const front = front9DisplayTotals[state.currentPlayerIndex] ?? 0;
