@@ -1,0 +1,3121 @@
+// src/screens/GolfGameScreen.tsx
+
+import React, { useMemo, useState, useEffect, useRef, useCallback } from "react";
+import {
+  View,
+  Text,
+  StyleSheet,
+  Pressable,
+  ScrollView,
+  SafeAreaView,
+  Platform,
+  Dimensions,
+  Alert,
+  Animated,
+} from "react-native";
+import { NativeStackScreenProps } from "@react-navigation/native-stack";
+import { RootStackParamList } from "../types/navigation";
+import { loadGolfSetup, saveGolfSetup } from "../storage/setupStorage";
+import { setLastLocalHandicapUpdated, scheduleHandicapCloudSync } from "../storage/handicapSyncStorage";
+
+import Dartboard from "../components/Dartboard";
+import { useDartSounds } from "../hooks/useDartSounds";
+
+// ✅ AutoDarts hook (your path)
+import { useAutoDarts } from "../autodarts/useAutoDarts";
+import { useTakeoutStallWarning } from "../autodarts/useTakeoutStallWarning";
+import { AUTO_BASE_URL, AUTO_WS_URL } from "../config/autodarts";
+
+import {
+  createGolfState,
+  applyDart,
+  acceptHole,
+  noScore,
+  undo,
+  redo,
+  evalDart,
+  getCurrentHole,
+  getPlayoffNeeds,
+  getPlayoffOptions,
+  setPlayoffOrder,
+  setPlayoffModeTie,
+  recomputeAllRewards,
+  type GolfDart,
+  type Hole,
+  type PlayoffKind,
+  type PlayoffTotalsOverrides,
+} from "../engine/golfEngine";
+
+type Props = NativeStackScreenProps<RootStackParamList, "GolfGame">;
+type Mode = "BOARD" | "LEADER";
+
+function holeLabel(h: Hole | null) {
+  if (h === null) return "—";
+  return h === "BULL" ? "Bull" : String(h);
+}
+
+
+function scoreLabel(v: number) {
+  if (v > 0) return `+${v}`;
+  return `${v}`;
+}
+
+function resultWord(score: number) {
+  switch (score) {
+    case 2:
+      return "No Score";
+    case 1:
+      return "Bogey";
+    case 0:
+      return "Par";
+    case -1:
+      return "Birdie";
+    case -2:
+      return "Eagle";
+    default:
+      return scoreLabel(score);
+  }
+}
+
+function ord(i: number) {
+  const n = i + 1;
+  if (n === 1) return "1st";
+  if (n === 2) return "2nd";
+  if (n === 3) return "3rd";
+  return `${n}th`;
+}
+
+function fmtReward(v: number) {
+  const n = Number.isFinite(v) ? v : 0;
+  const sign = n > 0 ? "+" : "";
+  return `${sign}${n.toFixed(2)}`;
+}
+
+function fmtSigned(n: number) {
+  const v = Number(n) || 0;
+  if (v === 0) return "Even";
+  return v > 0 ? `+${v}` : `${v}`;
+}
+
+function fmtThresh(n: number) {
+  const v = Number(n) || 0;
+  return v > 0 ? `≤ +${v}` : `≤ ${v}`;
+}
+
+/** Split full handicap for Nassau: front 9 and back 9. Odd handicap gives extra stroke to front 9. */
+function splitHandicapForNassau(fullHandicap: number): { front: number; back: number } {
+  const abs = Math.abs(fullHandicap);
+  return {
+    front: -Math.ceil(abs / 2),
+    back: -Math.floor(abs / 2),
+  };
+}
+
+function isNassauRound(holes: Hole[]) {
+  if (holes.length !== 19) return false;
+  if (!holes.includes("BULL")) return false;
+  for (let i = 1; i <= 18; i++) if (!holes.includes(i)) return false;
+  return true;
+}
+
+function colorFor(n: number) {
+  return n > 0 ? "#16a34a" : n < 0 ? "#dc2626" : "#64748b";
+}
+
+function shufflePlayers(names: string[]) {
+  const out = [...names];
+  for (let i = out.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [out[i], out[j]] = [out[j], out[i]];
+  }
+  return out;
+}
+
+function holeIndexMap(holes: Hole[]) {
+  const m = new Map<string, number>();
+  holes.forEach((h, idx) => m.set(h === "BULL" ? "BULL" : String(h), idx));
+  return m;
+}
+
+function legComplete(scoresByPlayer: (number | null)[][], idxs: number[]) {
+  return scoresByPlayer.every((row) => idxs.every((i) => row[i] !== null));
+}
+
+function legTotals(scoresByPlayer: (number | null)[][], idxs: number[]) {
+  return scoresByPlayer.map((row) => idxs.reduce((acc, i) => acc + (row[i] ?? 0), 0));
+}
+
+function leaderLabelForLeg(players: { name: string }[], totals: number[]) {
+  if (!players.length || totals.length !== players.length) return "—";
+  let best = Infinity;
+  for (const t of totals) best = Math.min(best, t);
+
+  const winners: number[] = [];
+  totals.forEach((t, i) => {
+    if (t === best) winners.push(i);
+  });
+
+  if (!winners.length) return "—";
+  if (winners.length === 1) return players[winners[0]]?.name ?? "—";
+  return `Tied: ${winners.map((i) => players[i]?.name ?? "?").join(", ")}`;
+}
+
+function allTieGroupsFromTotalsForLabel(totals: number[]) {
+  const n = totals.length;
+  const order = Array.from({ length: n }, (_, i) => i).sort((a, b) => totals[a] - totals[b]);
+  const out: { startPos: number }[] = [];
+  let pos = 0;
+  while (pos < n) {
+    const start = pos;
+    const t = totals[order[pos]];
+    while (pos < n && totals[order[pos]] === t) pos++;
+    if (pos - start >= 2) out.push({ startPos: start });
+  }
+  return out;
+}
+
+/** Build Nassau leg label from net totals and playoff resolutions (handicap + resolved order). */
+function nassauLegLabel(
+  players: { name: string }[],
+  totals: number[],
+  resolutions: Record<string, { mode: string; order: number[] | null }> | undefined
+): string {
+  const n = players.length;
+  if (!n || totals.length !== n) return "—";
+  const FULL = "-1";
+  const map = resolutions ?? {};
+  const fullRes = map[FULL];
+  const res =
+    fullRes ??
+    allTieGroupsFromTotalsForLabel(totals)
+      .map((g) => map[String(g.startPos)])
+      .find(Boolean) ??
+    null;
+  if (res?.mode === "PLAYOFF" && Array.isArray(res.order) && res.order.length === n) {
+    const ord = (i: number) => (i === 0 ? "1st" : i === 1 ? "2nd" : i === 2 ? "3rd" : `${i + 1}th`);
+    return res.order.map((idx, i) => `${ord(i)}: ${players[idx]?.name ?? "?"}`).join(", ");
+  }
+  return leaderLabelForLeg(players, totals);
+}
+
+function clamp(n: number, a: number, b: number) {
+  return Math.max(a, Math.min(b, n));
+}
+
+function ringLabel(ring: any): string {
+  if (!ring) return "—";
+  if (ring.kind === "MISS") return "—";
+  if (ring.kind === "SB") return "25";
+  if (ring.kind === "DB") return "50";
+  if (ring.kind === "S_IN" || ring.kind === "S_OUT") return String(ring.n ?? "—");
+  if (ring.kind === "D") return `D${ring.n ?? "—"}`;
+  if (ring.kind === "T") return `T${ring.n ?? "—"}`;
+  return "—";
+}
+
+function totalUpTo(scores: (number | null)[], holeIdx: number) {
+  let sum = 0;
+  for (let i = 0; i <= holeIdx; i++) sum += scores[i] ?? 0;
+  return sum;
+}
+
+function scoreNameForCell(score: number) {
+  switch (score) {
+    case 2:
+      return "Double";
+    case 1:
+      return "Bogey";
+    case 0:
+      return "Par";
+    case -1:
+      return "Birdie";
+    case -2:
+      return "Eagle";
+    default:
+      return "";
+  }
+}
+
+/** ---------- Nassau breakdown helpers (UI mirrors engine logic) ---------- */
+type TieGroup = {
+  startPos: number;
+  endPos: number;
+  tiedPlayerIndices: number[];
+  totals: number[];
+};
+
+function firstTieGroupFromTotals(totals: number[]): TieGroup | null {
+  const n = totals.length;
+  const indices = Array.from({ length: n }, (_, i) => i).sort((a, b) => totals[a] - totals[b]);
+
+  let pos = 0;
+  while (pos < n) {
+    const start = pos;
+    const t = totals[indices[pos]];
+    while (pos < n && totals[indices[pos]] === t) pos++;
+    const end = pos;
+
+    const group = indices.slice(start, end);
+    if (group.length >= 2) {
+      return { startPos: start, endPos: end, tiedPlayerIndices: group, totals };
+    }
+  }
+  return null;
+}
+
+function computePlacementDeltasFromTotals(totals: number[], placement: number[]) {
+  const n = totals.length;
+  const deltas = Array(n).fill(0);
+  const order = Array.from({ length: n }, (_, i) => i).sort((a, b) => totals[a] - totals[b]);
+
+  let pos = 0;
+  while (pos < n) {
+    const start = pos;
+    const t = totals[order[pos]];
+    while (pos < n && totals[order[pos]] === t) pos++;
+    const end = pos;
+
+    const tied = order.slice(start, end);
+    const k = tied.length;
+
+    let payoutSum = 0;
+    for (let j = 0; j < k; j++) payoutSum += Number(placement[start + j] ?? 0);
+
+    const each = k ? payoutSum / k : 0;
+    for (const playerIdx of tied) deltas[playerIdx] = each;
+  }
+
+  return deltas;
+}
+
+function computeDeltasFromOrder(order: number[], placement: number[]) {
+  const n = order.length;
+  const deltas = Array(n).fill(0);
+  for (let pos = 0; pos < n; pos++) {
+    const playerIdx = order[pos];
+    deltas[playerIdx] = Number(placement[pos] ?? 0);
+  }
+  return deltas;
+}
+
+function tieSplitForGroup(
+  n: number,
+  placement: number[],
+  group: TieGroup,
+  divisor: number,
+  multiplier = 1
+): { ok: boolean; deltas: number[]; eachShare: number; reason?: string } {
+  const deltas = Array(n).fill(0);
+  const k = group.tiedPlayerIndices.length;
+
+  const baseOrder = Array.from({ length: n }, (_, i) => i).sort((a, b) => group.totals[a] - group.totals[b]);
+
+  for (let pos = 0; pos < n; pos++) {
+    const playerIdx = baseOrder[pos];
+    deltas[playerIdx] = Number(placement[pos] ?? 0) * multiplier;
+  }
+
+  let payoutSum = 0;
+  for (let pos = group.startPos; pos < group.endPos; pos++) payoutSum += Number(placement[pos] ?? 0);
+  payoutSum *= multiplier;
+
+  if (payoutSum % k !== 0)
+    return { ok: false, deltas, eachShare: 0, reason: "Not evenly divisible across tied players" };
+
+  const each = payoutSum / k;
+  const d = Math.max(1, Math.floor(Number(divisor) || 1));
+  if (each % d !== 0) return { ok: false, deltas, eachShare: each, reason: `Each share must be divisible by ${d}` };
+
+  for (const idx of group.tiedPlayerIndices) deltas[idx] = each;
+
+  return { ok: true, deltas, eachShare: each };
+}
+
+function positionsFromTotals(totals: number[]) {
+  const n = totals.length;
+  const order = Array.from({ length: n }, (_, i) => i).sort((a, b) => totals[a] - totals[b]);
+
+  const out: { pos: number; tied: boolean }[] = Array.from({ length: n }, () => ({ pos: 0, tied: false }));
+
+  let pos = 0;
+  while (pos < n) {
+    const start = pos;
+    const t = totals[order[pos]];
+    while (pos < n && totals[order[pos]] === t) pos++;
+    const end = pos;
+
+    const tied = end - start >= 2;
+    const rank = start + 1;
+    for (let i = start; i < end; i++) {
+      out[order[i]] = { pos: rank, tied };
+    }
+  }
+
+  return out;
+}
+
+function posLabel(pos: { pos: number; tied: boolean }) {
+  if (!pos.pos) return "—";
+  const o = ord(pos.pos - 1);
+  return pos.tied ? `T${o}` : o;
+}
+
+function positionsFromOrder(order: number[]) {
+  const n = order.length;
+  const out: { pos: number; tied: boolean }[] = Array.from({ length: n }, () => ({ pos: 0, tied: false }));
+  for (let i = 0; i < n; i++) {
+    const playerIdx = order[i];
+    out[playerIdx] = { pos: i + 1, tied: false };
+  }
+  return out;
+}
+
+export default function GolfGameScreen({ route, navigation }: Props) {
+  const { setup } = route.params;
+
+  const onExitGame = useCallback(() => {
+    navigation.goBack();
+  }, [navigation]);
+
+  const cellMode: "HOLE" | "TOTAL" = setup.golf?.cellMode ?? "HOLE";
+  const showNetScore = !!(setup.golf?.showNetScore && cellMode === "TOTAL");
+
+  const { width: screenWidth, height: screenHeight } = Dimensions.get("window");
+  const base = Math.min(screenWidth, screenHeight);
+  const isLarge = base >= 900;
+  const isLandscape = screenWidth > screenHeight;
+
+  const ui = useMemo(() => {
+    const sidePadding = isLarge ? 22 : 12;
+    const gap = 10;
+    const playerSlots = 6;
+
+    // Hole column same width as player columns: (1 + playerSlots) columns + gaps
+    const totalWidth = screenWidth - sidePadding * 2;
+    const rawColW = (totalWidth - gap * playerSlots) / (1 + playerSlots);
+    const cellW = Math.max(isLarge ? 110 : 96, Math.min(Math.floor(rawColW), isLarge ? 170 : 130));
+    const holeW = cellW;
+
+    const btnGap = 12;
+    const btnCountBase = 5;
+    const btnRowW = screenWidth - sidePadding * 2;
+    const btnW = Math.floor((btnRowW - btnGap * (btnCountBase - 1)) / btnCountBase);
+
+    return {
+      title: isLarge ? 30 : 22,
+      sub: isLarge ? 20 : 16,
+
+      boardSize: Math.min(screenWidth - 16, screenHeight - 240, isLarge ? 1000 : 684),
+
+      btnPadV: isLarge ? 16 : 12,
+      btnText: isLarge ? 18 : 14,
+      btnW,
+
+      pillPadV: isLarge ? 12 : 9,
+      pillPadH: isLarge ? 14 : 12,
+      pillMinW: isLarge ? 170 : 120,
+      pillText: isLarge ? 18 : 14,
+
+      holeW,
+      cellW,
+      cellPad: isLarge ? 14 : 10,
+      td: isLarge ? 20 : 14,
+      th: isLarge ? 18 : 14,
+      tdFocus: (isLarge ? 20 : 14) + 2,
+      thFocus: (isLarge ? 18 : 14) + 1,
+
+      holesMaxH: screenHeight - (isLarge ? 420 : 360),
+    };
+  }, [isLarge, screenWidth, screenHeight]);
+
+  // CtB board size: same formula as Match/Killer so centered board matches other games
+  const ctbBoardSize = useMemo(() => {
+    const widthFactor = 0.75;
+    if (isLandscape) {
+      const rowWidth = screenWidth - 28;
+      const leftColWidth = rowWidth * 0.7;
+      const sizeByWidth = leftColWidth * 0.95;
+      const maxByHeight = screenHeight * (isLarge ? 0.82 : 0.78);
+      return Math.min(sizeByWidth, maxByHeight);
+    }
+    const maxByHeight = screenHeight * (isLarge ? 0.7 : 0.65);
+    const sizeByWidth = screenWidth * widthFactor;
+    return Math.min(sizeByWidth, maxByHeight);
+  }, [screenWidth, screenHeight, isLarge, isLandscape]);
+
+  const [mode, setMode] = useState<Mode>("LEADER");
+  const [viewedViaPeek, setViewedViaPeek] = useState(false);
+  const [showRewardsCard, setShowRewardsCard] = useState(false);
+
+  // =========================
+  // AUTO DARTS SETTINGS
+  // =========================
+  const AUTO_FINAL_PAUSE_MS = 1500; // unused now (status transition commits instead)
+  const AUTO_DEBUG = true;
+
+  const autoLastSourceRef = useRef<"AUTO" | "MANUAL" | null>(null);
+  const autoCommitTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  const overlayTimerRef = useRef<any>(null);
+
+  const [autoOverlayText, setAutoOverlayText] = useState<string | null>(null);
+
+  const setBigOverlay = useCallback((text: string | null, ms = 650) => {
+    if (overlayTimerRef.current) {
+      clearTimeout(overlayTimerRef.current);
+      overlayTimerRef.current = null;
+    }
+
+    setAutoOverlayText(text);
+
+    if (text) {
+      overlayTimerRef.current = setTimeout(() => {
+        overlayTimerRef.current = null;
+        setAutoOverlayText(null);
+      }, ms);
+    }
+  }, []);
+
+  function golfOverlayLabel(dart: any): string {
+    if (typeof dart === "string") return dart;
+    if (typeof dart === "number") return String(dart);
+    if (dart?.label) return String(dart.label);
+    if (dart?.code) return String(dart.code);
+    if (dart?.bed) return String(dart.bed);
+    return "—";
+  }
+
+  // Overlay is PERSISTENT until next dart (AUTO-only)
+  const showAutoOverlay = useCallback((text: string) => {
+    setAutoOverlayText(text);
+  }, []);
+
+  useEffect(() => {
+    return () => {
+      if (autoCommitTimerRef.current) clearTimeout(autoCommitTimerRef.current);
+      if (overlayTimerRef.current) clearTimeout(overlayTimerRef.current);
+    };
+  }, []);
+
+  const holesScrollRef = useRef<React.ElementRef<typeof ScrollView>>(null);
+
+  const [holesViewportH, setHolesViewportH] = useState(0);
+  const [holesContentH, setHolesContentH] = useState(0);
+  const [holeRowH, setHoleRowH] = useState(0);
+
+  const [state, setState] = useState(() => {
+    const s = createGolfState({
+      playerNames: setup.players,
+      holes: setup.golf?.holes,
+      side: setup.golf?.side,
+    });
+    const handicaps = (setup as any).golfHandicap?.startingHandicaps;
+    const applyHandicaps = (setup as any).golfHandicap?.settings?.applyHandicaps;
+    if (handicaps && typeof handicaps === "object" && applyHandicaps) {
+      s.placementHandicaps = setup.players.map((name) => Number(handicaps[name]) ?? 0);
+    }
+    return s;
+  });
+
+  // Scorecard UI: show Front/Back split totals when Nassau MODE is ON
+  const showFrontBackInTotalRow = useMemo(() => {
+    return !!setup.golf?.nassau && isNassauRound(state.holes);
+  }, [setup.golf?.nassau, state.holes]);
+
+  // Nassau + handicaps: per-player split (front 9 / back 9). Odd handicap → extra stroke on front.
+  const nassauHandicapSplit = useMemo(() => {
+    if (!setup.golf?.nassau || !(setup as any).golfHandicap?.settings?.applyHandicaps) return null;
+    const handicaps = (setup as any).golfHandicap?.startingHandicaps;
+    if (!handicaps || typeof handicaps !== "object") return null;
+    return state.players.map((p) => splitHandicapForNassau(Number(handicaps[p.name]) || 0));
+  }, [setup.golf?.nassau, setup, state.players]);
+
+  // When handicaps are applied, rewards use net totals (gross + handicap). Compute whenever applyHandicaps is true (podium); nassau legs only when Nassau is on.
+  const playoffTotalsOverrides = useMemo((): PlayoffTotalsOverrides | undefined => {
+    const applyHandicaps = (setup as any).golfHandicap?.settings?.applyHandicaps;
+    const handicaps = (setup as any).golfHandicap?.startingHandicaps;
+    if (!applyHandicaps || !handicaps || typeof handicaps !== "object") return undefined;
+    const grossOverall = state.players.map((p) => (p.scores as (number | null)[]).reduce<number>((a, v) => a + (v ?? 0), 0));
+    const podium = grossOverall.map((g, i) => g + (Number(handicaps[state.players[i].name]) ?? 0));
+    if (!setup.golf?.nassau || !nassauHandicapSplit) {
+      return { podium, nassauFront: undefined, nassauBack: undefined, nassauOverall: podium };
+    }
+    const idx = holeIndexMap(state.holes);
+    const frontIdxs = Array.from({ length: 9 }, (_, i) => idx.get(String(i + 1))!).filter((v) => Number.isFinite(v));
+    const backIdxs = Array.from({ length: 9 }, (_, i) => idx.get(String(i + 10))!).filter((v) => Number.isFinite(v));
+    const bullIdx = idx.get("BULL");
+    if (typeof bullIdx === "number") backIdxs.push(bullIdx);
+    const frontGross = state.players.map((p) => frontIdxs.reduce((acc, i) => acc + (p.scores[i] ?? 0), 0));
+    const backGross = state.players.map((p) => backIdxs.reduce((acc, i) => acc + (p.scores[i] ?? 0), 0));
+    const nassauFront = frontGross.map((r, i) => r + (nassauHandicapSplit[i]?.front ?? 0));
+    const nassauBack = backGross.map((r, i) => r + (nassauHandicapSplit[i]?.back ?? 0));
+    return { podium, nassauFront, nassauBack, nassauOverall: podium };
+  }, [state.players, state.holes, setup, nassauHandicapSplit]);
+
+  // Ensure state has placementHandicaps when setup has applyHandicaps, so engine always uses net for rewards (even on internal recompute).
+  const placementHandicapsFromSetup = useMemo(() => {
+    const applyHandicaps = (setup as any).golfHandicap?.settings?.applyHandicaps;
+    const handicaps = (setup as any).golfHandicap?.startingHandicaps;
+    if (!applyHandicaps || !handicaps || typeof handicaps !== "object") return null;
+    return state.players.map((p) => Number(handicaps[p.name]) ?? 0);
+  }, [setup, state.players]);
+  useEffect(() => {
+    if (placementHandicapsFromSetup == null) return;
+    setState((s) => {
+      const cur = s.placementHandicaps;
+      const same =
+        cur != null &&
+        cur.length === placementHandicapsFromSetup.length &&
+        cur.every((v, i) => v === placementHandicapsFromSetup[i]);
+      if (same) return s;
+      return recomputeAllRewards({ ...s, placementHandicaps: placementHandicapsFromSetup });
+    });
+  }, [placementHandicapsFromSetup]);
+
+  // Sync net totals into state so Nassau (and podium) rewards are computed from net when handicaps applied
+  const arrEq = (a: number[] | undefined, b: number[] | undefined) =>
+    (a?.length ?? 0) === (b?.length ?? 0) && (a ?? []).every((v, i) => v === (b ?? [])[i]);
+  useEffect(() => {
+    const next = playoffTotalsOverrides ?? undefined;
+    setState((s) => {
+      const cur = s.placementTotalsOverrides;
+      const same =
+        (next == null && cur == null) ||
+        (next != null &&
+          cur != null &&
+          arrEq(next.podium, cur.podium) &&
+          arrEq(next.nassauFront, cur.nassauFront) &&
+          arrEq(next.nassauBack, cur.nassauBack) &&
+          arrEq(next.nassauOverall, cur.nassauOverall));
+      if (same) return s;
+      return recomputeAllRewards({ ...s, placementTotalsOverrides: next });
+    });
+  }, [playoffTotalsOverrides]);
+
+  const [pending, setPending] = useState<GolfDart[]>([]);
+  const [closestToBullActive, setClosestToBullActive] = useState<boolean>(!!setup.closestToBull);
+  const [closestToBullOrder] = useState<string[]>(() => shufflePlayers(setup.players));
+  const [closestToBullIndex, setClosestToBullIndex] = useState(0);
+  const [closestToBullResults, setClosestToBullResults] = useState<Record<string, number>>({});
+
+  // Keep latest pending darts in a ref for status-based auto-commit
+  const pendingRef = useRef<GolfDart[]>([]);
+  useEffect(() => {
+    pendingRef.current = pending;
+  }, [pending]);
+
+  const [hitMarkers, setHitMarkers] = useState<{ x: number; y: number }[]>([]);
+  const closestToBullActiveRef = useRef<boolean>(!!setup.closestToBull);
+  const closestToBullIndexRef = useRef(0);
+  const closestToBullResultsRef = useRef<Record<string, number>>({});
+  const closestAwaitingFinalTakeoutRef = useRef(false);
+  const prevClosestToBullActiveRef = useRef<boolean>(!!setup.closestToBull);
+
+  const [showCtBMissOverlay, setShowCtBMissOverlay] = useState(false);
+  const ctbMissOpacityRef = useRef(new Animated.Value(0)).current;
+  const triggerCtBMissOverlayRef = useRef<() => void>(() => {});
+  const pendingNextCtBIndexRef = useRef<number | null>(null);
+
+  const [showThrowOrderSetOverlay, setShowThrowOrderSetOverlay] = useState(false);
+  const [throwOrderSetWinnerName, setThrowOrderSetWinnerName] = useState<string | null>(null);
+  const showThrowOrderSetOverlayRef = useRef<(winnerName: string) => void>(() => {});
+
+  // Stack of undone pending darts/markers for board Undo/Redo (markers + overlays)
+  const undoneDartsRef = useRef<GolfDart[]>([]);
+  const undoneMarkersRef = useRef<({ x: number; y: number } | null)[]>([]);
+
+  const currentPlayer = state.players[state.currentPlayerIndex];
+  const currentHole = getCurrentHole(state);
+
+  // ✅ Track AutoDarts status transitions (Takeout -> Throw)
+  const prevAutoStatusRef = useRef<string>("");
+  const takeoutInProgressRef = useRef<boolean>(false);
+
+  // Keep fresh refs for Auto callbacks (prevents stale closure issues)
+  const modeRef = useRef<Mode>(mode);
+  useEffect(() => {
+    modeRef.current = mode;
+  }, [mode]);
+
+  const holeRef = useRef<Hole | null>(currentHole);
+  useEffect(() => {
+    holeRef.current = currentHole;
+  }, [currentHole]);
+
+  const completeRef = useRef<boolean>(state.isComplete);
+  useEffect(() => {
+    completeRef.current = state.isComplete;
+  }, [state.isComplete]);
+  useEffect(() => {
+    closestToBullActiveRef.current = closestToBullActive;
+    if (closestToBullActive) setMode("BOARD");
+  }, [closestToBullActive]);
+  useEffect(() => {
+    closestToBullIndexRef.current = closestToBullIndex;
+  }, [closestToBullIndex]);
+
+  useEffect(() => {
+    showThrowOrderSetOverlayRef.current = (winnerName: string) => {
+      setShowThrowOrderSetOverlay(true);
+      setThrowOrderSetWinnerName(winnerName);
+    };
+    return () => {
+      showThrowOrderSetOverlayRef.current = () => {};
+    };
+  }, []);
+
+  useEffect(() => {
+    triggerCtBMissOverlayRef.current = () => setShowCtBMissOverlay(true);
+    return () => {
+      triggerCtBMissOverlayRef.current = () => {};
+    };
+  }, []);
+
+  useEffect(() => {
+    if (!showCtBMissOverlay) return;
+    ctbMissOpacityRef.setValue(0);
+    Animated.sequence([
+      Animated.timing(ctbMissOpacityRef, {
+        toValue: 1,
+        duration: 150,
+        useNativeDriver: true,
+      }),
+      Animated.delay(550),
+      Animated.timing(ctbMissOpacityRef, {
+        toValue: 0,
+        duration: 200,
+        useNativeDriver: true,
+      }),
+    ]).start(() => {
+      setShowCtBMissOverlay(false);
+      const pending = pendingNextCtBIndexRef.current;
+      pendingNextCtBIndexRef.current = null;
+      if (pending != null) {
+        setClosestToBullIndex(closestToBullIndexRef.current);
+        const nextIdx = closestToBullIndexRef.current;
+        if (nextIdx > 0 && nextIdx < closestToBullOrder.length && nextIdx % 3 === 0 && !closestAwaitingFinalTakeoutRef.current) {
+          setTimeout(() => forceBoardReset().catch(() => {}), 150);
+        }
+      }
+    });
+  }, [showCtBMissOverlay, ctbMissOpacityRef, closestToBullOrder.length]);
+
+  const [flashPlayer, setFlashPlayer] = useState<number | null>(null);
+
+  const rewardsOn = !!state.side?.enabled;
+
+  useEffect(() => {
+    if (!rewardsOn) setShowRewardsCard(false);
+  }, [rewardsOn]);
+
+  useEffect(() => {
+    const last = state.events[state.events.length - 1];
+    if (last?.kind === "REWARD") {
+      setFlashPlayer(last.playerIndex);
+      const t = setTimeout(() => setFlashPlayer(null), 1200);
+      return () => clearTimeout(t);
+    }
+  }, [state.events]);
+
+  // =========================
+  // RAPID TAP: lock ONLY for scoring taps
+  // =========================
+  const TAP_LOCK_MS = 90;
+  const tapLockedRef = useRef(false);
+
+  const lockScoringTap = useCallback(() => {
+    if (tapLockedRef.current) return false;
+    tapLockedRef.current = true;
+    setTimeout(() => {
+      tapLockedRef.current = false;
+    }, TAP_LOCK_MS);
+    return true;
+  }, []);
+
+  const { playHit, playReward } = useDartSounds();
+  const playHitRef = useRef(playHit);
+  useEffect(() => {
+    playHitRef.current = playHit;
+  }, [playHit]);
+
+  const prevEventsLenRef = useRef(0);
+  const prevCompleteRef = useRef<boolean>(state.isComplete);
+
+  useEffect(() => {
+    const len = state.events.length;
+
+    if (len > prevEventsLenRef.current) {
+      const last = state.events[len - 1] as any;
+      if (last?.kind === "REWARD") {
+        playReward();
+      }
+    }
+
+    prevEventsLenRef.current = len;
+  }, [state.events, playReward]);
+
+  useEffect(() => {
+    if (!prevCompleteRef.current && state.isComplete) {
+      playReward();
+    }
+    prevCompleteRef.current = state.isComplete;
+  }, [state.isComplete, playReward]);
+
+  // ✅ On round complete: append gross (raw) round total to handicap history when Update Handicaps is ON (handicap calc uses gross, not net)
+  const handicapPersistDoneRef = useRef(false);
+  useEffect(() => {
+    if (!state.isComplete || handicapPersistDoneRef.current) return;
+    const updateHandicaps = (setup as any).golfHandicap?.settings?.updateHandicaps;
+    if (!updateHandicaps) return;
+
+    handicapPersistDoneRef.current = true;
+    (async () => {
+      const stored = await loadGolfSetup();
+      if (!stored?.golfHandicap) return;
+      const scoresByPlayer = { ...(stored.golfHandicap.scoresByPlayer ?? {}) };
+      const personalBestByPlayer = { ...(stored.golfHandicap.personalBestByPlayer ?? {}) };
+      for (const p of state.players) {
+        const name = p.name;
+        if (!name) continue;
+        const grossRoundTotal = (p.scores as (number | null)[]).reduce<number>((sum, s) => sum + (s ?? 0), 0);
+        const list = scoresByPlayer[name] ?? [];
+        scoresByPlayer[name] = [...list, grossRoundTotal];
+        const currentPb = personalBestByPlayer[name];
+        if (currentPb == null || grossRoundTotal < currentPb) {
+          personalBestByPlayer[name] = grossRoundTotal;
+        }
+      }
+      await saveGolfSetup({
+        ...stored,
+        golfHandicap: {
+          ...stored.golfHandicap,
+          scoresByPlayer,
+          personalBestByPlayer,
+        },
+      });
+      setLastLocalHandicapUpdated(new Date().toISOString());
+      scheduleHandicapCloudSync();
+    })();
+  }, [state.isComplete, state.players, setup]);
+
+  // ✅ Clear overlay at the start of each new turn / hole
+  useEffect(() => {
+    setAutoOverlayText(null);
+  }, [state.currentPlayerIndex, currentHole]);
+
+
+    // =========================
+  // AutoDarts UI state + labels
+  // =========================
+  const [autoResetting, setAutoResetting] = useState(false);
+
+  const [autoStatus, setAutoStatus] = useState<string>("");
+  const [autoNumThrows, setAutoNumThrows] = useState<number>(0);
+  const [boardProfileMode, setBoardProfileMode] = useState<"auto" | "manual">("auto");
+  const usingAutoBoard = boardProfileMode === "auto";
+
+  const resetLabel = useMemo(() => {
+    if (autoResetting) return "Resetting…";
+
+    const s = String(autoStatus ?? "").toLowerCase();
+    if (s.includes("takeout")) return "Reset (Takeout)";
+
+    const n = Math.min(3, Math.max(0, Number(autoNumThrows) || 0));
+    if (n === 1) return "Reset (1/3)";
+    if (n === 2) return "Reset (2/3)";
+    if (n === 3) return "Reset (3/3)";
+    return "Reset";
+  }, [autoResetting, autoStatus, autoNumThrows]);
+
+  const restartLabel = useMemo(() => {
+    if (autoResetting) return "Working…";
+    const s = String(autoStatus ?? "").toLowerCase();
+    if (s.includes("stopped")) return "Restart (Stopped)";
+    return "Restart";
+  }, [autoResetting, autoStatus]); // same logic in CtB and main game
+
+  // noteAutoAlive still called from onStatus/onThrow; connection dot uses useAutoDarts.connected
+  const noteAutoAlive = useCallback(() => {}, []);
+
+  // --- AutoDarts: require a "clear board" before accepting new darts ---
+  // (kept as-is for your future use; not currently enforced in onThrow)
+  const seenThrowKeysRef = useRef<Set<string>>(new Set());
+  const awaitingClearRef = useRef<boolean>(false);
+
+  const resetAutoForNewTurn = useCallback(() => {
+    seenThrowKeysRef.current = new Set();
+    awaitingClearRef.current = true;
+  }, []);
+
+  const RESET_FETCH_TIMEOUT_MS = 8000;
+  const doResetAndRefetch = useCallback(() => {
+    const root = String(AUTO_BASE_URL ?? "").replace(/\/+$/, "");
+    const timeout = (ms: number) =>
+      new Promise<never>((_, reject) => setTimeout(() => reject(new Error("Reset timeout")), ms));
+    const resetAndRefetch = () =>
+      fetch(`${root}/api/reset`, { method: "POST" })
+        .then(() => fetch(`${root}/api/state`).then((r) => r.json()))
+        .then((data: any) => {
+          const status = data?.status;
+          const numThrows = Number(data?.numThrows ?? data?.numDarts ?? 0);
+          if (status != null) setAutoStatus(String(status));
+          if (Number.isFinite(numThrows)) setAutoNumThrows(numThrows);
+        });
+    return Promise.race([resetAndRefetch(), timeout(RESET_FETCH_TIMEOUT_MS)]).catch((e) => {
+      console.warn("[AutoDarts] reset/refetch failed or timed out", e);
+    });
+  }, []);
+
+  useEffect(() => {
+    if (!closestToBullActive) return;
+    doResetAndRefetch();
+  }, [closestToBullActive, doResetAndRefetch]);
+
+  // =========================
+  // Commit current pending darts & advance hole
+  // =========================
+  const clearPending = useCallback(() => {
+    setPending([]);
+  }, []);
+
+  const commitPendingAndEndHole = useCallback(
+    (dartsOverride?: GolfDart[]) => {
+      // cancel any scheduled AUTO commit (prevents double-commit)
+      if (autoCommitTimerRef.current) {
+        clearTimeout(autoCommitTimerRef.current);
+        autoCommitTimerRef.current = null;
+      }
+
+      if (state.isComplete) {
+        setMode("LEADER");
+        return;
+      }
+
+      const dartsToCommit = dartsOverride ?? pending;
+      if (!dartsToCommit.length) return;
+
+      setState((s0) => {
+        let s = s0;
+        for (const d of dartsToCommit) s = applyDart(s, d);
+        s = acceptHole(s);
+        return recomputeAllRewards(s, playoffTotalsOverrides ?? undefined);
+      });
+
+      setHitMarkers([]);
+      clearPending();
+      undoneDartsRef.current = [];
+      undoneMarkersRef.current = [];
+      setMode("LEADER");
+
+      // require clear before accepting next player's throws
+      resetAutoForNewTurn();
+
+      autoLastSourceRef.current = null;
+      setAutoOverlayText(null);
+    },
+    [pending, state.isComplete, clearPending, resetAutoForNewTurn]
+  );
+
+  // =========================
+  // AutoDarts: commit when Takeout -> Throw (auto-advance)
+  // =========================
+  const commitIfReadyFromStatus = useCallback(() => {
+    if (completeRef.current) return;
+
+    const darts = pendingRef.current ?? [];
+    if (!darts.length) return;
+
+    // Cancel any scheduled commit (if you ever re-enable timers)
+    if (autoCommitTimerRef.current) {
+      clearTimeout(autoCommitTimerRef.current);
+      autoCommitTimerRef.current = null;
+    }
+
+    setAutoOverlayText(null);
+    commitPendingAndEndHole(darts);
+  }, [commitPendingAndEndHole]);
+
+  // =========================
+  // AutoDarts -> pending[] + correct scoring (inner/outer)
+  // =========================
+  const segmentToGolfDartFromAuto = useCallback((seg: any): GolfDart => {
+    if (!seg) return { kind: "MISS" };
+
+    const name = String(seg.name ?? "").trim();
+    const bed = String(seg.bed ?? "").toLowerCase();
+    const num = Number(seg.number ?? NaN);
+    const mult = Number(seg.multiplier ?? NaN);
+
+    // Miss near X: "M8" => MISS
+    if (name.toUpperCase().startsWith("M")) return { kind: "MISS" };
+
+    // Bulls
+    if (name.toLowerCase() === "bull" || num === 25) {
+      if (mult === 2 || bed.includes("double")) return { kind: "DB" };
+      return { kind: "SB" };
+    }
+
+    // If already formatted like S18/D16/T19
+    const m = name.match(/^([SDT])\s*(\d{1,2})$/i);
+    if (m) {
+      const letter = m[1].toUpperCase();
+      const n = Number(m[2]);
+      if (letter === "T") return { kind: "T", n };
+      if (letter === "D") return { kind: "D", n };
+
+      // Single: inner vs outer via bed
+      if (bed.includes("inner")) return { kind: "S_IN", n };
+      return { kind: "S_OUT", n };
+    }
+
+    // Otherwise infer from number + multiplier
+    if (Number.isFinite(num) && num >= 1 && num <= 20) {
+      if (mult === 3) return { kind: "T", n: num };
+      if (mult === 2) return { kind: "D", n: num };
+
+      // mult === 1
+      if (bed.includes("inner")) return { kind: "S_IN", n: num };
+      return { kind: "S_OUT", n: num };
+    }
+
+    return { kind: "MISS" };
+  }, []);
+
+  function mapRingToGolfDart(ring: any): GolfDart {
+    if (!ring || !ring.kind) return { kind: "MISS" };
+    switch (ring.kind) {
+      case "MISS":
+        return { kind: "MISS" };
+      case "SB":
+        return { kind: "SB" };
+      case "DB":
+        return { kind: "DB" };
+      case "S_IN":
+        return { kind: "S_IN", n: Number(ring.n) };
+      case "S_OUT":
+        return { kind: "S_OUT", n: Number(ring.n) };
+      case "D":
+        return { kind: "D", n: Number(ring.n) };
+      case "T":
+        return { kind: "T", n: Number(ring.n) };
+      default:
+        return { kind: "MISS" };
+    }
+  }
+
+  const results3 = useMemo(() => {
+    const out: string[] = [];
+    for (let i = 0; i < 3; i++) {
+      const d = pending[i];
+      if (!d || !currentHole) {
+        out.push("—");
+        continue;
+      }
+      const res = evalDart(currentHole, d);
+      out.push(resultWord(res.score));
+    }
+    return out;
+  }, [pending, currentHole]);
+
+
+    // =========================
+  // 3) TIES / PLAYOFFS (engine-backed; use net totals when handicaps applied)
+  // =========================
+  const playoffNeeds = useMemo(() => getPlayoffNeeds(state, playoffTotalsOverrides), [state, playoffTotalsOverrides]);
+
+  /** Track which (kind, startPos) we have already prompted. */
+  const promptedPlayoffsRef = useRef<Record<string, boolean>>({});
+  /** Prevent multiple playoff alerts showing at once; clear when user dismisses. */
+  const playoffAlertOpenRef = useRef(false);
+
+  function promptPlayoffOrder(
+    kind: PlayoffKind,
+    title: string,
+    tiedPlayers: number[],
+    groupStartPos: number,
+    onComplete?: () => void
+  ) {
+    const players = state.players;
+    const remaining = [...tiedPlayers];
+    const order: number[] = [];
+
+    const pickNext = () => {
+      if (remaining.length === 1) {
+        order.push(remaining[0]);
+        remaining.splice(0, 1);
+      }
+
+      if (remaining.length === 0) {
+        const totalsForKind =
+          kind === "PODIUM"
+            ? playoffTotalsOverrides?.podium
+            : kind === "NASSAU_FRONT"
+              ? playoffTotalsOverrides?.nassauFront
+              : kind === "NASSAU_BACK"
+                ? playoffTotalsOverrides?.nassauBack
+                : playoffTotalsOverrides?.nassauOverall;
+        setState((s) =>
+          recomputeAllRewards(
+            setPlayoffOrder(s, kind, order, groupStartPos, totalsForKind ?? undefined),
+            playoffTotalsOverrides ?? undefined
+          )
+        );
+        onComplete?.();
+        return;
+      }
+
+      const place = order.length + 1;
+      Alert.alert(
+        title,
+        `Playoff result: who finished ${ord(place - 1)} (among tied players)?`,
+        remaining.map((idx) => ({
+          text: players[idx]?.name ?? "?",
+          onPress: () => {
+            const j = remaining.indexOf(idx);
+            if (j >= 0) remaining.splice(j, 1);
+            order.push(idx);
+            pickNext();
+          },
+        }))
+      );
+    };
+
+    pickNext();
+  }
+
+  function promptResolution(kind: PlayoffKind, title: string, groupStartPos: number, onDismiss?: () => void) {
+    const opts = getPlayoffOptions(state, kind, playoffTotalsOverrides, groupStartPos);
+    if (!opts.tiedPlayerIndices?.length) return;
+
+    const wrap = (fn: () => void) => () => {
+      fn();
+      onDismiss?.();
+    };
+
+    const buttons: any[] = [];
+
+    if (opts.canTie) {
+      buttons.push({
+        text: "Keep Tie (split)",
+        onPress: wrap(() =>
+          setState((s) => recomputeAllRewards(setPlayoffModeTie(s, kind, groupStartPos), playoffTotalsOverrides ?? undefined))
+        ),
+      });
+    }
+
+    if (opts.canPlayoff) {
+      buttons.push({
+        text: "Playoff",
+        onPress: () => promptPlayoffOrder(kind, title, opts.tiedPlayerIndices, groupStartPos, onDismiss),
+      });
+    }
+
+    if (!buttons.length) {
+      Alert.alert(
+        title,
+        opts.reasonIfNoTie
+          ? `Tie detected, but Tie (split) is not available: ${opts.reasonIfNoTie}. Enable Playoffs or adjust the divisor in Setup.`
+          : "Tie detected, but no resolution option is available. Check Setup.",
+        [{ text: "OK", onPress: onDismiss }]
+      );
+      return;
+    }
+
+    const msg =
+      opts.canTie && opts.canPlayoff
+        ? "Tie detected. Choose Tie (split) or Playoff."
+        : opts.canPlayoff
+        ? "Tie detected. A playoff is required."
+        : "Tie detected. The tie will be kept (split).";
+
+    Alert.alert(title, msg, buttons);
+  }
+
+  // --------------------------
+  // 1) Rewards row behavior
+  // --------------------------
+  const displayRewardsTotals = useMemo(() => {
+    const n = state.players.length;
+    const zero = Array(n).fill(0);
+
+    if (!rewardsOn) return zero;
+    if (!state.isComplete) return state.rewards?.streak?.slice?.() ?? zero;
+    return state.rewards?.total?.slice?.() ?? zero;
+  }, [rewardsOn, state.isComplete, state.players.length, state.rewards]);
+
+  const prevTotalsRef = useRef<number[]>(displayRewardsTotals);
+  const [rewardsPulse, setRewardsPulse] = useState(false);
+
+  useEffect(() => {
+    if (!rewardsOn) {
+      setRewardsPulse(false);
+      prevTotalsRef.current = displayRewardsTotals;
+      return;
+    }
+
+    const prev = prevTotalsRef.current ?? [];
+    const changed =
+      prev.length !== displayRewardsTotals.length ||
+      displayRewardsTotals.some((v, i) => Number(v ?? 0) !== Number(prev[i] ?? 0));
+
+    if (changed) {
+      setRewardsPulse(true);
+      const t = setTimeout(() => setRewardsPulse(false), 700);
+      prevTotalsRef.current = displayRewardsTotals;
+      return () => clearTimeout(t);
+    }
+
+    prevTotalsRef.current = displayRewardsTotals;
+  }, [displayRewardsTotals, rewardsOn]);
+
+  // =========================
+  // Nassau Leg Tracker (labels) — use net totals when handicaps on; use resolved playoff order when complete
+  // =========================
+  const nassau = useMemo(() => {
+    const modeOn = !!setup.golf?.nassau && isNassauRound(state.holes);
+    if (!modeOn) {
+      return {
+        enabled: false,
+        front: { complete: false, label: "—" },
+        back: { complete: false, label: "—" },
+        overall: { complete: false, label: "—" },
+      };
+    }
+
+    const idx = holeIndexMap(state.holes);
+
+    const frontIdxs = Array.from({ length: 9 }, (_, i) => idx.get(String(i + 1))!).filter((v) => Number.isFinite(v));
+    const backIdxs = Array.from({ length: 9 }, (_, i) => idx.get(String(i + 10))!).filter((v) => Number.isFinite(v));
+
+    const bullIdx = idx.get("BULL");
+    if (typeof bullIdx === "number") backIdxs.push(bullIdx);
+
+    const overallIdxs = [...frontIdxs, ...backIdxs];
+
+    const scoresByPlayer = state.players.map((p) => p.scores as (number | null)[]);
+
+    let frontTotals = legTotals(scoresByPlayer, frontIdxs);
+    let backTotals = legTotals(scoresByPlayer, backIdxs);
+    let overallTotals = legTotals(scoresByPlayer, overallIdxs);
+    if (nassauHandicapSplit && nassauHandicapSplit.length === state.players.length) {
+      frontTotals = frontTotals.map((t, i) => t + (nassauHandicapSplit[i]?.front ?? 0));
+      backTotals = backTotals.map((t, i) => t + (nassauHandicapSplit[i]?.back ?? 0));
+      overallTotals = overallTotals.map((t, i) => t + (nassauHandicapSplit[i]?.front ?? 0) + (nassauHandicapSplit[i]?.back ?? 0));
+    }
+
+    const frontTotalsForLabel = playoffTotalsOverrides?.nassauFront ?? frontTotals;
+    const backTotalsForLabel = playoffTotalsOverrides?.nassauBack ?? backTotals;
+    const overallTotalsForLabel = playoffTotalsOverrides?.nassauOverall ?? overallTotals;
+    const frontLabel = nassauLegLabel(state.players, frontTotalsForLabel, state.playoffs?.nassauFrontResolutions);
+    const backLabel = nassauLegLabel(state.players, backTotalsForLabel, state.playoffs?.nassauBackResolutions);
+    const overallLabel = nassauLegLabel(state.players, overallTotalsForLabel, state.playoffs?.nassauOverallResolutions);
+
+    return {
+      enabled: true,
+      front: {
+        complete: legComplete(scoresByPlayer, frontIdxs),
+        label: frontLabel,
+      },
+      back: {
+        complete: legComplete(scoresByPlayer, backIdxs),
+        label: backLabel,
+      },
+      overall: {
+        complete: legComplete(scoresByPlayer, overallIdxs),
+        label: overallLabel,
+      },
+    };
+  }, [state, setup.golf?.nassau, nassauHandicapSplit, playoffTotalsOverrides]);
+
+  // ✅ Rewards-only Nassau (for payouts / playoffs)
+  const nassauRewardsOn = !!state.side?.enabled && !!state.side?.nassauOn && isNassauRound(state.holes);
+
+  const front9Reached =
+    nassauRewardsOn && !!state.side?.nassauFrontResolveAfter9 && !!nassau.enabled && !!nassau.front.complete;
+
+  useEffect(() => {
+    const canPrompt = state.isComplete || front9Reached;
+    const kinds: PlayoffKind[] = ["PODIUM", "NASSAU_FRONT", "NASSAU_BACK", "NASSAU_OVERALL"];
+    const groupArrays = [playoffNeeds.podiumTieGroups, playoffNeeds.nassauFrontTieGroups, playoffNeeds.nassauBackTieGroups, playoffNeeds.nassauOverallTieGroups];
+
+    const neededKeys = new Set<string>();
+    for (let i = 0; i < kinds.length; i++)
+      groupArrays[i].forEach((g) => neededKeys.add(`${kinds[i]}:${g.startPos}`));
+    Object.keys(promptedPlayoffsRef.current).forEach((k) => {
+      if (!neededKeys.has(k)) delete promptedPlayoffsRef.current[k];
+    });
+
+    if (!canPrompt) return;
+    if (playoffAlertOpenRef.current) return;
+
+    const titles = ["Podium Tie", "Nassau Front 9 Tie", "Nassau Back 9 Tie", "Nassau Overall Tie"];
+    for (let i = 0; i < kinds.length; i++) {
+      const kind = kinds[i];
+      const groups = groupArrays[i];
+      for (const g of groups) {
+        const key = `${kind}:${g.startPos}`;
+        if (!promptedPlayoffsRef.current[key]) {
+          promptedPlayoffsRef.current[key] = true;
+          playoffAlertOpenRef.current = true;
+          const posLabel = g.startPos === 0 ? "1st" : g.endPos === state.players.length ? "last" : `positions ${g.startPos + 1}–${g.endPos}`;
+          const onDismiss = () => { playoffAlertOpenRef.current = false; };
+          promptResolution(kind, `${titles[i]} (${posLabel})`, g.startPos, onDismiss);
+          return;
+        }
+      }
+    }
+  }, [front9Reached, playoffNeeds, state.isComplete, state.players.length]);
+
+  const winnerNames = useMemo(() => {
+    if (!state.isComplete) return null;
+    const n = state.players.length;
+    const totalsForStandings =
+      playoffTotalsOverrides?.nassauOverall ?? playoffTotalsOverrides?.podium ?? state.players.map((p) => p.total);
+    if (totalsForStandings.length !== n) return state.winnerIndices?.length ? state.winnerIndices.map((i) => state.players[i]?.name ?? "?").join(", ") : "—";
+    let best = Infinity;
+    for (let i = 0; i < n; i++) best = Math.min(best, totalsForStandings[i]);
+    const indices: number[] = [];
+    for (let i = 0; i < n; i++) if (totalsForStandings[i] === best) indices.push(i);
+    if (!indices.length) return "—";
+    return indices.map((i) => state.players[i]?.name ?? "?").join(", ");
+  }, [state.isComplete, state.winnerIndices, state.players, playoffTotalsOverrides]);
+
+  const front9Totals = useMemo(() => {
+    if (!showFrontBackInTotalRow) return null;
+
+    const idx = holeIndexMap(state.holes);
+    const frontIdxs = Array.from({ length: 9 }, (_, i) => idx.get(String(i + 1))!).filter((v) => Number.isFinite(v));
+
+    return state.players.map((p) => frontIdxs.reduce((acc, i) => acc + (p.scores[i] ?? 0), 0));
+  }, [showFrontBackInTotalRow, state.holes, state.players]);
+
+  const back9Totals = useMemo(() => {
+    if (!showFrontBackInTotalRow) return null;
+
+    const idx = holeIndexMap(state.holes);
+    const backIdxs = Array.from({ length: 9 }, (_, i) => idx.get(String(i + 10))!).filter((v) => Number.isFinite(v));
+
+    const bullIdx = idx.get("BULL");
+    if (typeof bullIdx === "number") backIdxs.push(bullIdx);
+
+    return state.players.map((p) => backIdxs.reduce((acc, i) => acc + (p.scores[i] ?? 0), 0));
+  }, [showFrontBackInTotalRow, state.holes, state.players]);
+
+  // When showNetScore is on, add handicap split for total row even if Nassau is off
+  const netDisplaySplit = useMemo(() => {
+    if (!showNetScore || !placementHandicapsFromSetup?.length) return null;
+    return placementHandicapsFromSetup.map((h) => ({
+      front: -Math.ceil(Math.abs(h) / 2),
+      back: -Math.floor(Math.abs(h) / 2),
+    }));
+  }, [showNetScore, placementHandicapsFromSetup]);
+
+  // Nassau + handicaps: display totals = raw + split handicap (so -4 → -2 front, -2 back)
+  const front9DisplayTotals = useMemo(() => {
+    if (!front9Totals) return null;
+    if (netDisplaySplit) return front9Totals.map((raw, i) => raw + (netDisplaySplit[i]?.front ?? 0));
+    if (nassauHandicapSplit) return front9Totals.map((raw, i) => raw + (nassauHandicapSplit[i]?.front ?? 0));
+    return front9Totals;
+  }, [front9Totals, nassauHandicapSplit, netDisplaySplit]);
+  const back9DisplayTotals = useMemo(() => {
+    if (!back9Totals) return null;
+    if (netDisplaySplit) return back9Totals.map((raw, i) => raw + (netDisplaySplit[i]?.back ?? 0));
+    if (nassauHandicapSplit) return back9Totals.map((raw, i) => raw + (nassauHandicapSplit[i]?.back ?? 0));
+    return back9Totals;
+  }, [back9Totals, nassauHandicapSplit, netDisplaySplit]);
+
+  // (Your full nassauLegBreakdown block continues exactly as you pasted — kept unchanged)
+  const nassauLegBreakdown = useMemo(() => {
+    const n = state.players.length;
+    const zero = Array(n).fill(0);
+
+    const enabled = !!state.side?.enabled && !!state.side?.nassauOn && isNassauRound(state.holes);
+    if (!enabled || !state.isComplete) {
+      return {
+        enabled: false,
+        front: { on: false, deltas: zero, pos: Array(n).fill({ pos: 0, tied: false }), totals: zero },
+        back: { on: false, deltas: zero, pos: Array(n).fill({ pos: 0, tied: false }), totals: zero },
+        overall: { on: false, deltas: zero, pos: Array(n).fill({ pos: 0, tied: false }), totals: zero },
+      };
+    }
+
+    const placement = Array.from({ length: n }, (_, i) => Number(state.side.placement?.[i] ?? 0));
+    const scoresByPlayer = state.players.map((p) => p.scores as (number | null)[]);
+
+    const idx = holeIndexMap(state.holes);
+    const frontIdxs = Array.from({ length: 9 }, (_, i) => idx.get(String(i + 1))!).filter(Number.isFinite);
+    const backIdxs = Array.from({ length: 9 }, (_, i) => idx.get(String(i + 10))!).filter(Number.isFinite);
+    const bullIdx = idx.get("BULL");
+    if (typeof bullIdx === "number") backIdxs.push(bullIdx);
+    const overallIdxs = [...frontIdxs, ...backIdxs];
+
+    let frontTotals = legTotals(scoresByPlayer, frontIdxs);
+    let backTotals = legTotals(scoresByPlayer, backIdxs);
+    let overallTotals = legTotals(scoresByPlayer, overallIdxs);
+    if (nassauHandicapSplit && nassauHandicapSplit.length === n) {
+      frontTotals = frontTotals.map((t, i) => t + (nassauHandicapSplit[i]?.front ?? 0));
+      backTotals = backTotals.map((t, i) => t + (nassauHandicapSplit[i]?.back ?? 0));
+      overallTotals = overallTotals.map((t, i) => t + (nassauHandicapSplit[i]?.front ?? 0) + (nassauHandicapSplit[i]?.back ?? 0));
+    }
+
+    const tieDiv = Number(state.side.tieDivisor ?? 5);
+    const backMult = Number(state.side.nassauBackMultiplier ?? 1);
+
+    const resolutionsForKind = (k: PlayoffKind) => {
+      if (k === "NASSAU_FRONT") return state.playoffs?.nassauFrontResolutions ?? {};
+      if (k === "NASSAU_BACK") return state.playoffs?.nassauBackResolutions ?? {};
+      return state.playoffs?.nassauOverallResolutions ?? {};
+    };
+    const FULL_ORDER_KEY = "-1";
+
+    const allTieGroupsFromTotals = (totals: number[]) => {
+      const order = Array.from({ length: totals.length }, (_, i) => i).sort((a, b) => totals[a] - totals[b]);
+      const out: { startPos: number; endPos: number; tiedPlayerIndices: number[] }[] = [];
+      let pos = 0;
+      while (pos < order.length) {
+        const start = pos;
+        const t = totals[order[pos]];
+        while (pos < order.length && totals[order[pos]] === t) pos++;
+        const end = pos;
+        if (end - start >= 2) out.push({ startPos: start, endPos: end, tiedPlayerIndices: order.slice(start, end) });
+      }
+      return out;
+    };
+
+    const resolveLeg = (kind: PlayoffKind, totals: number[], mult: number) => {
+      const complete = true;
+      const baseOrder = Array.from({ length: n }, (_, i) => i).sort((a, b) => totals[a] - totals[b]);
+
+      const groups = allTieGroupsFromTotals(totals);
+      const resolutions = resolutionsForKind(kind);
+      const fullRes = resolutions[FULL_ORDER_KEY];
+
+      let fullOrder: number[] =
+        fullRes?.mode === "PLAYOFF" && Array.isArray(fullRes.order) && fullRes.order.length === n
+          ? fullRes.order
+          : [...baseOrder];
+
+      if (!fullRes?.order && groups.length > 0) {
+        for (const g of groups) {
+          const res = resolutions[String(g.startPos)];
+          if (res?.mode === "PLAYOFF" && Array.isArray(res.order) && res.order.length === n) {
+            fullOrder = [
+              ...fullOrder.slice(0, g.startPos),
+              ...res.order.slice(g.startPos, g.endPos),
+              ...fullOrder.slice(g.endPos),
+            ];
+          }
+        }
+      }
+
+      const hasPlayoffOrder = fullRes?.mode === "PLAYOFF" && fullRes?.order?.length === n;
+      const hasMergedGroupOrders = groups.length > 0 && groups.some((g) => resolutions[String(g.startPos)]?.mode === "PLAYOFF");
+      if (hasPlayoffOrder || hasMergedGroupOrders) {
+        const d = computeDeltasFromOrder(fullOrder, placement).map((x) => (Number(x) || 0) * mult);
+        return { complete, deltas: d, pos: positionsFromOrder(fullOrder), totals };
+      }
+
+      if (groups.length === 0) {
+        const d = computePlacementDeltasFromTotals(totals, placement).map((x) => (Number(x) || 0) * mult);
+        return { complete, deltas: d, pos: positionsFromTotals(totals), totals };
+      }
+
+      const group = groups[0];
+      const groupRes = resolutions[String(group.startPos)];
+      if (groupRes?.mode === "TIE") {
+        const chk = tieSplitForGroup(n, placement, { ...group, totals }, tieDiv, mult);
+        return { complete, deltas: chk.ok ? chk.deltas : zero, pos: positionsFromTotals(totals), totals };
+      }
+
+      return { complete, deltas: zero, pos: positionsFromTotals(totals), totals };
+    };
+
+    const frontOn = !!state.side?.nassauFrontOn && legComplete(scoresByPlayer, frontIdxs);
+    const backOn = !!state.side?.nassauBackOn && legComplete(scoresByPlayer, backIdxs);
+    const overallOn = !!state.side?.nassauOverallOn && legComplete(scoresByPlayer, overallIdxs);
+
+    return {
+      enabled: true,
+      front: frontOn
+        ? { on: true, ...resolveLeg("NASSAU_FRONT", frontTotals, 1) }
+        : { on: false, deltas: zero, pos: positionsFromTotals(frontTotals), totals: frontTotals },
+      back: backOn
+        ? { on: true, ...resolveLeg("NASSAU_BACK", backTotals, backMult) }
+        : { on: false, deltas: zero, pos: positionsFromTotals(backTotals), totals: backTotals },
+      overall: overallOn
+        ? { on: true, ...resolveLeg("NASSAU_OVERALL", overallTotals, 1) }
+        : { on: false, deltas: zero, pos: positionsFromTotals(overallTotals), totals: overallTotals },
+    };
+  }, [state, nassauHandicapSplit]);
+
+  // Nassau summary labels derived from leg breakdown (same resolved order as Final Summary)
+  const nassauSummaryLabelsFromBreakdown = useMemo(() => {
+    const n = state.players.length;
+    if (!state.isComplete || n === 0) return null;
+    if (!state.side?.enabled || !state.side?.nassauOn || !isNassauRound(state.holes)) return null;
+    const players = state.players;
+    const ord = (i: number) => (i === 0 ? "1st" : i === 1 ? "2nd" : i === 2 ? "3rd" : `${i + 1}th`);
+    const labelFromPos = (pos: { pos: number; tied: boolean }[] | undefined) => {
+      if (!pos || pos.length !== n) return null;
+      const byPos = players.map((_, i) => ({ i, pos: pos[i]?.pos ?? 0 }));
+      byPos.sort((a, b) => a.pos - b.pos);
+      return byPos.map((x, i) => `${ord(i)}: ${players[x.i]?.name ?? "?"}`).join(", ");
+    };
+    const front = labelFromPos(nassauLegBreakdown.front.pos);
+    const back = labelFromPos(nassauLegBreakdown.back.pos);
+    const overall = labelFromPos(nassauLegBreakdown.overall.pos);
+    return { front, back, overall };
+  }, [nassauLegBreakdown, state.players, state.isComplete, state.holes, state.side?.enabled, state.side?.nassauOn]);
+
+  // ✅ Auto-scroll holes list so active hole stays roughly mid-screen
+  useEffect(() => {
+    if (mode !== "LEADER") return;
+    if (state.isComplete) return;
+    if (!holesScrollRef.current) return;
+    if (!holesViewportH || !holesContentH || !holeRowH) return;
+
+    const focusIdx = state.players[state.currentPlayerIndex]?.holeIndex ?? 0;
+    const anchor = showRewardsCard ? 0.35 : 0.45;
+
+    const focusTop = focusIdx * holeRowH;
+    const targetY = focusTop - holesViewportH * anchor;
+
+    const maxY = Math.max(0, holesContentH - holesViewportH);
+    const y = clamp(targetY, 0, maxY);
+
+    holesScrollRef.current.scrollTo({ y, animated: true });
+  }, [
+    mode,
+    showRewardsCard,
+    holesViewportH,
+    holesContentH,
+    holeRowH,
+    state.currentPlayerIndex,
+    state.players,
+    state.isComplete,
+  ]);
+
+  const playoffsPending = useMemo(() => {
+    const needs = getPlayoffNeeds(state, playoffTotalsOverrides);
+    return (
+      needs.podiumTieGroups.length > 0 ||
+      needs.nassauFrontTieGroups.length > 0 ||
+      needs.nassauBackTieGroups.length > 0 ||
+      needs.nassauOverallTieGroups.length > 0
+    );
+  }, [state, playoffTotalsOverrides]);
+
+  const effectiveBoardSize = closestToBullActive ? ctbBoardSize : ui.boardSize;
+
+  const markerFromAutoCoords = useCallback(
+    (coords?: { x?: number; y?: number } | null) => {
+      const x = coords?.x;
+      const y = coords?.y;
+      if (typeof x !== "number" || typeof y !== "number") return null;
+
+      const boardSize = effectiveBoardSize;
+      const absMax = Math.max(Math.abs(x), Math.abs(y));
+
+      if (absMax <= 1.5) {
+        // Preserve radial spread: don't clamp to 1.05 or close darts (e.g. 1.03 vs 1.20) collapse
+        const nx = Math.max(-1.25, Math.min(1.25, x));
+        const ny = Math.max(-1.25, Math.min(1.25, y));
+        // AutoDarts normalized radius maps slightly inside our board edge.
+        const profileScale = usingAutoBoard ? 1.0 : 0.94;
+        const rOuter = boardSize * (isLarge ? 0.47 : 0.43) * profileScale;
+        const cx = boardSize / 2;
+        const cy = boardSize / 2;
+        // Radius-dependent scale: treble (r~0.6) stays ~1.0, outer (r~0.9) scales in so single doesn't land on double
+        const r = Math.sqrt(nx * nx + ny * ny) || 0.001;
+        const rScale = Math.max(0.76, Math.min(0.93, 0.76 + 0.07 * r));
+        return { x: cx + nx * rOuter * rScale, y: cy - ny * rOuter * rScale };
+      }
+
+      if (x >= -8 && x <= boardSize + 8 && y >= -8 && y <= boardSize + 8) {
+        return {
+          x: Math.max(0, Math.min(boardSize, x)),
+          y: Math.max(0, Math.min(boardSize, y)),
+        };
+      }
+
+      return null;
+    },
+    [effectiveBoardSize, isLarge, usingAutoBoard]
+  );
+
+  const distanceFromAutoCoords = useCallback(
+    (coords?: { x?: number; y?: number } | null) => {
+      const x = coords?.x;
+      const y = coords?.y;
+      if (typeof x !== "number" || typeof y !== "number") return null;
+      const absMax = Math.max(Math.abs(x), Math.abs(y));
+      if (absMax <= 1.5) return Math.hypot(x, y);
+
+      const marker = markerFromAutoCoords(coords);
+      if (!marker) return null;
+      const cx = effectiveBoardSize / 2;
+      const cy = effectiveBoardSize / 2;
+      const rOuter = effectiveBoardSize * (isLarge ? 0.47 : 0.43);
+      return Math.hypot(marker.x - cx, marker.y - cy) / Math.max(1, rOuter);
+    },
+    [effectiveBoardSize, isLarge, markerFromAutoCoords]
+  );
+
+  const restartWithPlayerOrder = useCallback(
+    (orderedPlayers: string[]) => {
+      let s = createGolfState({
+        playerNames: orderedPlayers,
+        holes: setup.golf?.holes,
+        side: setup.golf?.side,
+      });
+      const handicaps = (setup as any).golfHandicap?.startingHandicaps;
+      const applyHandicaps = (setup as any).golfHandicap?.settings?.applyHandicaps;
+      if (handicaps && typeof handicaps === "object") {
+        s.players = s.players.map((p) => ({
+          ...p,
+          total: handicaps[p.name] != null ? Number(handicaps[p.name]) : 0,
+        }));
+        if (applyHandicaps) {
+          s.placementHandicaps = orderedPlayers.map((name) => Number(handicaps[name]) ?? 0);
+        }
+      }
+      setState(s);
+      setPending([]);
+      setHitMarkers([]);
+      setAutoOverlayText(null);
+      setMode("LEADER");
+      setViewedViaPeek(false);
+      setClosestToBullResults({});
+      closestToBullResultsRef.current = {};
+      closestAwaitingFinalTakeoutRef.current = false;
+    },
+    [setup]
+  );
+
+  const finalizeClosestToBull = useCallback(() => {
+    setShowThrowOrderSetOverlay(false);
+    setThrowOrderSetWinnerName(null);
+    const nextResults = closestToBullResultsRef.current;
+    const indexOf = new Map<string, number>();
+    closestToBullOrder.forEach((p, i) => indexOf.set(p, i));
+    const ordered = [...closestToBullOrder].sort((a, b) => {
+      const da = nextResults[a] ?? Number.POSITIVE_INFINITY;
+      const db = nextResults[b] ?? Number.POSITIVE_INFINITY;
+      // Golf: closest to bull throws last, so reverse order.
+      if (da !== db) return db - da;
+      return (indexOf.get(a) ?? 0) - (indexOf.get(b) ?? 0);
+    });
+    setClosestToBullActive(false);
+    closestToBullActiveRef.current = false;
+    setClosestToBullIndex(0);
+    closestToBullIndexRef.current = 0;
+    closestAwaitingFinalTakeoutRef.current = false;
+    setHitMarkers([]); // clear CtB markers when progressing to game
+    restartWithPlayerOrder(ordered);
+  }, [closestToBullOrder, restartWithPlayerOrder]);
+
+  const recordClosestToBullThrow = useCallback(
+    (dist: number, deferAdvance?: boolean) => {
+      if (!closestToBullActiveRef.current) return;
+      if (closestAwaitingFinalTakeoutRef.current) return;
+      const player = closestToBullOrder[closestToBullIndexRef.current];
+      if (!player) return;
+
+      const nextResults = { ...closestToBullResultsRef.current, [player]: dist };
+      closestToBullResultsRef.current = nextResults;
+      setClosestToBullResults(nextResults);
+
+      const nextIndex = closestToBullIndexRef.current + 1;
+      const triggerThrowOrderOverlay = () => {
+        const res = closestToBullResultsRef.current;
+        const indexOf = new Map<string, number>();
+        closestToBullOrder.forEach((p, i) => indexOf.set(p, i));
+        const ordered = [...closestToBullOrder].sort((a, b) => {
+          const da = res[a] ?? Number.POSITIVE_INFINITY;
+          const db = res[b] ?? Number.POSITIVE_INFINITY;
+          if (da !== db) return db - da;
+          return (indexOf.get(a) ?? 0) - (indexOf.get(b) ?? 0);
+        });
+        showThrowOrderSetOverlayRef.current?.(ordered[0] ?? "—");
+      };
+      if (deferAdvance) {
+        closestToBullIndexRef.current = nextIndex;
+        if (nextIndex >= closestToBullOrder.length) {
+          closestAwaitingFinalTakeoutRef.current = true;
+          triggerThrowOrderOverlay();
+        }
+        pendingNextCtBIndexRef.current = nextIndex;
+        return;
+      }
+      if (nextIndex >= closestToBullOrder.length) {
+        closestAwaitingFinalTakeoutRef.current = true;
+        triggerThrowOrderOverlay();
+        return;
+      }
+      setClosestToBullIndex(nextIndex);
+      closestToBullIndexRef.current = nextIndex;
+    },
+    [closestToBullOrder]
+  );
+
+  const undoLastCtBThrow = useCallback(() => {
+    const idx = closestToBullIndexRef.current;
+    const prevIndex =
+      showThrowOrderSetOverlay || idx >= closestToBullOrder.length
+        ? closestToBullOrder.length - 1
+        : idx - 1;
+    if (prevIndex < 0) return;
+    const playerToRemove = closestToBullOrder[prevIndex];
+    const nextResults = { ...closestToBullResultsRef.current };
+    delete nextResults[playerToRemove];
+    closestToBullResultsRef.current = nextResults;
+    setClosestToBullResults(nextResults);
+    setClosestToBullIndex(prevIndex);
+    closestToBullIndexRef.current = prevIndex;
+    if (showThrowOrderSetOverlay || idx >= closestToBullOrder.length) {
+      setShowThrowOrderSetOverlay(false);
+      setThrowOrderSetWinnerName(null);
+      closestAwaitingFinalTakeoutRef.current = false;
+    }
+    setHitMarkers((prev) => (prev.length > 0 ? prev.slice(0, -1) : prev));
+  }, [closestToBullOrder, showThrowOrderSetOverlay]);
+
+  const canUndoCtB = closestToBullActive && (closestToBullIndex > 0 || showThrowOrderSetOverlay);
+
+  // =========================
+  // AutoDarts: hook wiring
+  // =========================
+  const { forceBoardReset, connected: autoConnected } = useAutoDarts({
+    url: AUTO_WS_URL,
+    baseUrl: AUTO_BASE_URL,
+    enabled: !state.isComplete,
+    debug: true,
+
+    onStatus: (s) => {
+      noteAutoAlive();
+
+      const nextStatus = String(s?.status ?? "");
+      const nextNumThrows = Number(s?.numThrows ?? 0);
+      const nextL = nextStatus.toLowerCase();
+      const isTakeoutInProgress = nextL.includes("takeout") && nextL.includes("progress");
+      takeoutInProgressRef.current = isTakeoutInProgress;
+
+      // For UI (labels)
+      setAutoStatus(nextStatus);
+      setAutoNumThrows(nextNumThrows);
+
+      // Takeout -> Throw transition
+      const prev = String(prevAutoStatusRef.current ?? "");
+      const prevL = prev.toLowerCase();
+
+      const wasTakeout = prevL.includes("takeout");
+      const isThrow = nextL === "throw" || nextL.includes("throw");
+
+      prevAutoStatusRef.current = nextStatus;
+
+      // ✅ Auto-advance on TAKEOUT -> THROW
+      // (no mode restriction; works even if you're on Scorecard already)
+      if (wasTakeout && isThrow) {
+        if (closestToBullActiveRef.current) {
+          if (closestAwaitingFinalTakeoutRef.current) finalizeClosestToBull();
+          return;
+        }
+        commitIfReadyFromStatus();
+      }
+    },
+
+    onThrow: (t: any) => {
+      noteAutoAlive();
+
+      if (completeRef.current) return;
+
+      if (modeRef.current === "LEADER") setMode("BOARD");
+      autoLastSourceRef.current = "AUTO";
+
+      const dart = segmentToGolfDartFromAuto(t?.segment);
+      const marker = markerFromAutoCoords(t?.coords);
+      if (marker) {
+        setHitMarkers((prev) => (closestToBullActiveRef.current ? [...prev, marker] : [...prev, marker].slice(0, 3)));
+      }
+      if (closestToBullActiveRef.current) {
+        if (takeoutInProgressRef.current) return; // Ignore stale throw(s) from "Takeout in progress"
+        playHitRef.current?.();
+        const dist = distanceFromAutoCoords(t?.coords);
+        const isMiss = typeof dist !== "number" || !Number.isFinite(dist);
+        if (isMiss) triggerCtBMissOverlayRef.current?.();
+        recordClosestToBullThrow(
+          typeof dist === "number" && Number.isFinite(dist) ? dist : Number.POSITIVE_INFINITY,
+          isMiss
+        );
+        // CtB with 4+ players: after every 3 darts (when more players remain), reset board so next player can throw
+        const nextIdx = closestToBullIndexRef.current;
+        if (nextIdx > 0 && nextIdx < closestToBullOrder.length && nextIdx % 3 === 0 && !closestAwaitingFinalTakeoutRef.current) {
+          setTimeout(() => forceBoardReset().catch(() => {}), 150);
+        }
+        return;
+      }
+
+      playHit();
+
+      const hole = holeRef.current;
+      const res = hole ? evalDart(hole, dart) : null;
+      if (res) showAutoOverlay(resultWord(res.score));
+
+      setPending((prev) => {
+        if (prev.length >= 3) return prev;
+        return [...prev, dart];
+      });
+    },
+  });
+
+  // =========================
+  // AutoDarts: Reset + Restart buttons
+  // =========================
+  const resetAutoDartsHard = useCallback(async () => {
+    if (autoResetting) return;
+    setAutoResetting(true);
+    // Advance hole/turn with functional update so UI sees next player immediately (avoids "one step late")
+    if ((pendingRef.current?.length ?? 0) >= 3) {
+      commitPendingAndEndHole(pendingRef.current!);
+    }
+    takeoutInProgressRef.current = false;
+    try {
+      await forceBoardReset();
+    } catch (e) {
+      console.warn("[AutoDarts] reset failed", e);
+    } finally {
+      setAutoResetting(false);
+    }
+  }, [autoResetting, forceBoardReset, commitPendingAndEndHole]);
+
+  // Restart = PUT /api/start only (same in CtB and main game)
+  const restartAutoDartsHard = useCallback(async () => {
+    if (autoResetting) return;
+    setAutoResetting(true);
+    try {
+      const root = String(AUTO_BASE_URL ?? "").replace(/\/+$/, "");
+      await fetch(`${root}/api/start`, { method: "PUT" });
+      setHitMarkers([]);
+      setClosestToBullIndex(0);
+      closestToBullIndexRef.current = 0;
+      seenThrowKeysRef.current = new Set();
+      awaitingClearRef.current = true;
+    } catch (e) {
+      console.warn("[AutoDarts] restart failed", e);
+    } finally {
+      setAutoResetting(false);
+    }
+  }, [autoResetting]);
+
+  // Takeout stall warning: popup after 3s if "Takeout in Progress" doesn't clear
+  const isTakeoutInProgress = useMemo(() => {
+    const s = String(autoStatus ?? "").toLowerCase();
+    return s.includes("takeout") && s.includes("progress");
+  }, [autoStatus]);
+  const onResetTakeoutGolf = useCallback(() => {
+    takeoutInProgressRef.current = false;
+    resetAutoDartsHard();
+  }, [resetAutoDartsHard]);
+  const { takeoutStallModal } = useTakeoutStallWarning({
+    isTakeoutInProgress,
+    onResetTakeout: onResetTakeoutGolf,
+    turnKey: `${state.currentPlayerIndex}-${currentPlayer?.holeIndex ?? 0}`,
+  });
+
+  // =========================
+  // BOARD MODE
+  // =========================
+  if (mode === "BOARD") {
+    const doneDisabled = state.isComplete || pending.length === 0;
+
+    return (
+      <SafeAreaView style={styles.safe}>
+        {takeoutStallModal}
+        <View style={styles.full}>
+          <View style={styles.topBar}>
+            <View style={{ flexDirection: "row", alignItems: "center" }}>
+              <Pressable style={styles.exitLink} onPress={onExitGame}>
+                <Text style={styles.exitLinkText}>‹ Golf Setup</Text>
+              </Pressable>
+              {/* LEFT: Title + subtitle (one line in landscape to save space) */}
+              <View
+                style={[
+                  { flex: 1, marginLeft: 10 },
+                  isLandscape
+                    ? { flexDirection: "row", alignItems: "center", gap: 8, flexWrap: "wrap" }
+                    : { gap: 6 },
+                ]}
+              >
+                <Text style={[styles.title, { fontSize: ui.title }]}>Golf</Text>
+                <Text
+                  style={[styles.sub, { fontSize: ui.sub }]}
+                  numberOfLines={1}
+                  ellipsizeMode="tail"
+                >
+                  {state.isComplete
+                    ? `🏁 Complete • Winner(s): ${winnerNames ?? "—"}`
+                    : closestToBullActive
+                    ? `${closestToBullOrder.length} Players · Closest to Bull • Throwing: ${closestToBullOrder[closestToBullIndex] ?? "—"}`
+                    : `Throwing: ${currentPlayer.name} • Target: ${holeLabel(currentHole)}`}
+                </Text>
+              </View>
+
+              {/* RIGHT: Undo (CtB), Reset, Restart, Dot */}
+              <View style={styles.autoRightGroup}>
+                {!closestToBullActive && (
+                  <Pressable
+                    style={[styles.autoBoardBtn, autoResetting && { opacity: 0.5 }]}
+                    disabled={autoResetting}
+                    onPress={() => setBoardProfileMode((m) => (m === "auto" ? "manual" : "auto"))}
+                  >
+                    <Text style={styles.autoBoardText}>{usingAutoBoard ? "Board: Auto" : "Board: Manual"}</Text>
+                  </Pressable>
+                )}
+
+                {closestToBullActive && (
+                  <Pressable
+                    style={[styles.autoResetBtn, !canUndoCtB && { opacity: 0.5 }]}
+                    disabled={!canUndoCtB}
+                    onPress={undoLastCtBThrow}
+                  >
+                    <Text style={styles.autoResetText}>Undo</Text>
+                  </Pressable>
+                )}
+
+                <Pressable
+                  style={[styles.autoResetBtn, autoResetting && { opacity: 0.5 }]}
+                  disabled={autoResetting}
+                  onPress={resetAutoDartsHard}
+                >
+                  <Text style={styles.autoResetText}>{resetLabel}</Text>
+                </Pressable>
+
+                <Pressable
+                  style={[styles.autoRestartBtn, autoResetting && { opacity: 0.5 }]}
+                  disabled={autoResetting}
+                  onPress={restartAutoDartsHard}
+                >
+                  <Text style={styles.autoRestartText}>{restartLabel}</Text>
+                </Pressable>
+
+                <View style={[styles.autoDot, autoConnected ? styles.autoDotOn : styles.autoDotOff]} />
+              </View>
+            </View>
+          </View>
+
+          <View style={[styles.center, { padding: isLarge ? 10 : 6 }, closestToBullActive && { flex: 1 }]}>
+            {/* Board wrapper so we can overlay text on top */}
+            <View style={{ position: "relative" }}>
+              <Dartboard
+                size={closestToBullActive ? ctbBoardSize : ui.boardSize}
+                disabled={state.isComplete}
+                inputDisabled={state.isComplete || (!closestToBullActive && pending.length >= 3)}
+                boardProfile={closestToBullActive ? "standard" : (usingAutoBoard ? "standard" : "manual")}
+                highlightTarget={closestToBullActive ? "BULL" : currentHole}
+                hitMarkers={hitMarkers}
+                maxMarkers={closestToBullActive ? Math.max(3, closestToBullOrder.length) : 3}
+                onHitMarker={(pt) => {
+                  if (closestToBullActive) {
+                    if (showThrowOrderSetOverlay) {
+                      finalizeClosestToBull();
+                      return;
+                    }
+                    const rOuter = (closestToBullActive ? ctbBoardSize : ui.boardSize) * (isLarge ? 0.47 : 0.43);
+                    const cx = (closestToBullActive ? ctbBoardSize : ui.boardSize) / 2;
+                    const cy = cx;
+                    const dist = Math.hypot(pt.x - cx, pt.y - cy) / Math.max(1, rOuter);
+                    recordClosestToBullThrow(dist);
+                    setHitMarkers((prev) => [...prev, pt].slice(-Math.max(3, closestToBullOrder.length)));
+                    playHit();
+                    return;
+                  }
+                  setHitMarkers((prev) => [...prev, pt].slice(0, 3));
+                }}
+                onDart={() => {}}
+                onDartDetail={(ring: any) => {
+                  if (closestToBullActive) return;
+                  if (state.isComplete) return;
+                  if (pending.length >= 3) return;
+                  if (!lockScoringTap()) return;
+
+                  // Cancel any scheduled AUTO finish if user manually interacts
+                  if (autoCommitTimerRef.current) {
+                    clearTimeout(autoCommitTimerRef.current);
+                    autoCommitTimerRef.current = null;
+                  }
+
+                  autoLastSourceRef.current = "MANUAL";
+                  undoneDartsRef.current = [];
+                  undoneMarkersRef.current = [];
+
+                  const dart = mapRingToGolfDart(ring);
+
+                  const res = currentHole ? evalDart(currentHole, dart) : null;
+                  if (res) {
+                    setAutoOverlayText(resultWord(res.score));
+                  }
+
+                  playHit();
+                  setPending((p) => (p.length >= 3 ? p : [...p, dart]));
+                }}
+              />
+
+              {/* ✅ overlay label (big, across the board) */}
+              {!!autoOverlayText && (
+                <View
+                  pointerEvents="none"
+                  style={[
+                    styles.autoOverlay,
+                    {
+                      width: ui.boardSize,
+                      height: ui.boardSize,
+                    },
+                  ]}
+                >
+                  <Text
+                    style={[
+                      styles.autoOverlayText,
+                      {
+                        fontSize: Math.max(44, Math.floor(ui.boardSize * 0.12)),
+                      },
+                    ]}
+                  >
+                    {autoOverlayText}
+                  </Text>
+                </View>
+              )}
+              {closestToBullActive && !showThrowOrderSetOverlay && (
+                <View pointerEvents="none" style={styles.closestOverlay}>
+                  <Text style={styles.closestOverlayText}>
+                    {closestToBullOrder[closestToBullIndex] ?? "—"}
+                  </Text>
+                </View>
+              )}
+              {closestToBullActive && showCtBMissOverlay && (
+                <Animated.View
+                  pointerEvents="none"
+                  style={[StyleSheet.absoluteFill, styles.ctbMissOverlayWrap, { opacity: ctbMissOpacityRef }]}
+                >
+                  <Text style={styles.ctbMissOverlayText}>Miss</Text>
+                </Animated.View>
+              )}
+              {closestToBullActive && showThrowOrderSetOverlay && (
+                <View pointerEvents="none" style={[StyleSheet.absoluteFill, styles.ctbMissOverlayWrap]}>
+                  <Text style={styles.ctbThrowOrderSetTitle}>Throw Order Set</Text>
+                  <Text style={styles.ctbThrowOrderSetSub}>
+                    {throwOrderSetWinnerName ?? "—"} goes first
+                  </Text>
+                </View>
+              )}
+            </View>
+          </View>
+
+          {!closestToBullActive && (
+          <View
+            style={[
+              styles.bottomBar,
+              { paddingBottom: (isLarge ? 18 : 12) + (Platform.OS === "ios" ? 6 : 0) },
+            ]}
+          >
+            <View style={styles.dartsRow}>
+              {results3.map((label, i) => (
+                <View
+                  key={i}
+                  style={[
+                    styles.dartPill,
+                    {
+                      paddingVertical: ui.pillPadV,
+                      paddingHorizontal: ui.pillPadH,
+                      minWidth: ui.pillMinW,
+                    },
+                  ]}
+                >
+                  <Text style={[styles.dartPillText, { fontSize: ui.pillText }]}>{label}</Text>
+                </View>
+              ))}
+            </View>
+
+            <View style={styles.buttonsRowBoard}>
+              <Pressable
+                style={[styles.btnBoard, { paddingVertical: ui.btnPadV }]}
+                onPress={() => {
+                  if (autoCommitTimerRef.current) {
+                    clearTimeout(autoCommitTimerRef.current);
+                    autoCommitTimerRef.current = null;
+                  }
+                  if (pending.length > 0) {
+                    undoneDartsRef.current = [...undoneDartsRef.current, pending[pending.length - 1]];
+                    undoneMarkersRef.current = [...undoneMarkersRef.current, hitMarkers[hitMarkers.length - 1] ?? null];
+                    setPending((p) => p.slice(0, -1));
+                    setHitMarkers((m) => m.slice(0, -1));
+                    const newLength = pending.length - 1;
+                    if (newLength >= 1 && currentHole) {
+                      const res = evalDart(currentHole, pending[newLength - 1]);
+                      setAutoOverlayText(resultWord(res.score));
+                    } else {
+                      setAutoOverlayText(null);
+                    }
+                  } else {
+                    undoneDartsRef.current = [];
+                    undoneMarkersRef.current = [];
+                    setAutoOverlayText(null);
+                    setState((s) => recomputeAllRewards(undo(s), playoffTotalsOverrides ?? undefined));
+                  }
+                }}
+              >
+                <Text style={[styles.btnText, { fontSize: ui.btnText }]}>Undo</Text>
+              </Pressable>
+
+              <Pressable
+                style={[styles.btnBoard, { paddingVertical: ui.btnPadV }]}
+                onPress={() => {
+                  const stack = undoneDartsRef.current;
+                  if (stack.length > 0 && pending.length < 3) {
+                    const dart = stack[stack.length - 1];
+                    const markers = undoneMarkersRef.current;
+                    const marker = markers.length > 0 ? markers[markers.length - 1] : null;
+                    undoneDartsRef.current = stack.slice(0, -1);
+                    undoneMarkersRef.current = markers.slice(0, -1);
+                    setPending((p) => [...p, dart]);
+                    if (marker != null) {
+                      setHitMarkers((m) => [...m, marker].slice(0, 3));
+                    }
+                    if (currentHole) {
+                      const res = evalDart(currentHole, dart);
+                      setAutoOverlayText(resultWord(res.score));
+                    }
+                  } else {
+                    setState((s) => recomputeAllRewards(redo(s), playoffTotalsOverrides ?? undefined));
+                  }
+                }}
+              >
+                <Text style={[styles.btnText, { fontSize: ui.btnText }]}>Redo</Text>
+              </Pressable>
+
+              <Pressable
+                style={[styles.btnBoard, { paddingVertical: ui.btnPadV }]}
+                onPress={() => {
+                  setViewedViaPeek(true);
+                  setMode("LEADER");
+                }}
+              >
+                <Text style={[styles.btnText, { fontSize: ui.btnText }]}>Peek</Text>
+              </Pressable>
+
+              <Pressable
+                style={[styles.btnBoard, { paddingVertical: ui.btnPadV }]}
+                onPress={() => {
+                  if (autoCommitTimerRef.current) {
+                    clearTimeout(autoCommitTimerRef.current);
+                    autoCommitTimerRef.current = null;
+                  }
+
+                  // No Score: ends current player’s hole immediately (+2) and advances
+                  undoneDartsRef.current = [];
+                  undoneMarkersRef.current = [];
+                  clearPending();
+                  setHitMarkers([]);
+                  setState((s) => recomputeAllRewards(noScore(s), playoffTotalsOverrides ?? undefined));
+                  setMode("LEADER");
+                  autoLastSourceRef.current = null;
+                  setAutoOverlayText(null);
+                }}
+              >
+                <Text style={[styles.btnText, { fontSize: ui.btnText }]}>No Score</Text>
+              </Pressable>
+
+              <Pressable
+                style={[styles.btnBoard, { paddingVertical: ui.btnPadV }, doneDisabled && styles.btnDisabled]}
+                disabled={doneDisabled}
+                onPress={() => commitPendingAndEndHole()}
+              >
+                <Text style={[styles.btnText, { fontSize: ui.btnText }]}>Done</Text>
+              </Pressable>
+            </View>
+          </View>
+          )}
+        </View>
+      </SafeAreaView>
+    );
+  }
+
+   // =========================
+  // SCORECARD MODE
+  // =========================
+  const placementConfig = state.side?.placement ?? [];
+
+  return (
+    <SafeAreaView style={styles.safe}>
+      {takeoutStallModal}
+      <View style={styles.full}>
+        <View style={styles.topBar}>
+          <View style={{ flexDirection: "row", alignItems: "center" }}>
+            <Pressable style={styles.exitLink} onPress={onExitGame}>
+              <Text style={styles.exitLinkText}>‹ Golf Setup</Text>
+            </Pressable>
+            {/* LEFT: Title + subtitle on one line */}
+            <View style={{ flexDirection: "row", alignItems: "center", gap: 8, flex: 1, marginLeft: 10, flexWrap: "wrap" }}>
+              <Text style={[styles.title, { fontSize: ui.title }]}>Scorecard</Text>
+              <Text style={[styles.sub, { fontSize: ui.sub }]} numberOfLines={1} ellipsizeMode="tail">
+                {state.isComplete
+                  ? `🏁 Complete • Winner(s): ${winnerNames ?? "—"}`
+                  : `Up next: ${currentPlayer.name} • Hole: ${holeLabel(currentHole)}`}
+              </Text>
+
+              {state.isComplete && !playoffsPending && (
+                <Text style={{ marginTop: 4, opacity: 0.7, fontWeight: "800" }}>
+                  Playoffs resolved ✓
+                </Text>
+              )}
+            </View>
+
+            {/* RIGHT: Undo (CtB), Reset + Restart + Dot */}
+            <View style={styles.autoRightGroup}>
+              {!closestToBullActive && (
+                <Pressable
+                  style={[styles.autoBoardBtn, autoResetting && { opacity: 0.5 }]}
+                  disabled={autoResetting}
+                  onPress={() => setBoardProfileMode((m) => (m === "auto" ? "manual" : "auto"))}
+                >
+                  <Text style={styles.autoBoardText}>{usingAutoBoard ? "Board: Auto" : "Board: Manual"}</Text>
+                </Pressable>
+              )}
+
+              {closestToBullActive && (
+                <Pressable
+                  style={[styles.autoResetBtn, (closestToBullIndex <= 0 && !showThrowOrderSetOverlay) && { opacity: 0.5 }]}
+                  disabled={closestToBullIndex <= 0 && !showThrowOrderSetOverlay}
+                  onPress={undoLastCtBThrow}
+                >
+                  <Text style={styles.autoResetText}>Undo</Text>
+                </Pressable>
+              )}
+
+              <Pressable
+                style={[styles.autoResetBtn, autoResetting && { opacity: 0.5 }]}
+                disabled={autoResetting}
+                onPress={resetAutoDartsHard}
+              >
+                <Text style={styles.autoResetText}>{resetLabel}</Text>
+              </Pressable>
+
+              <Pressable
+                style={[styles.autoRestartBtn, autoResetting && { opacity: 0.5 }]}
+                disabled={autoResetting}
+                onPress={restartAutoDartsHard}
+              >
+                <Text style={styles.autoRestartText}>{restartLabel}</Text>
+              </Pressable>
+
+              <View style={[styles.autoDot, autoConnected ? styles.autoDotOn : styles.autoDotOff]} />
+            </View>
+          </View>
+        </View>
+
+        {/* Rewards info card */}
+        {rewardsOn && showRewardsCard && (
+          <View style={{ paddingHorizontal: 12, paddingTop: 10, maxHeight: "45%" }}>
+            <View style={styles.sideCard}>
+              <Text style={styles.cardTitle}>Rewards (On)</Text>
+              <ScrollView
+                style={{ maxHeight: 320 }}
+                showsVerticalScrollIndicator={true}
+                nestedScrollEnabled
+              >
+              {state.side?.placementOn && (
+                <>
+                  <Text style={styles.cardHeader}>Podium Rewards</Text>
+                  <View style={styles.badgeRow}>
+                    {placementConfig.map((v, i) => (
+                      <View key={i} style={styles.badge}>
+                        <Text style={styles.badgeText}>
+                          {ord(i)}: {fmtSigned(v)}
+                        </Text>
+                      </View>
+                    ))}
+                  </View>
+                </>
+              )}
+
+              {nassau.enabled && (
+                <>
+                  <Text style={styles.cardHeader}>Nassau</Text>
+                  <Text style={styles.cardSub}>
+                    Front 9, Back 9 + Bull, Overall (labels update as legs complete).
+                  </Text>
+
+                  <View style={styles.legRow}>
+                    <View style={styles.legPill}>
+                      <Text style={styles.legPillText}>
+                        Front: {nassau.front.complete ? "✓" : "…"} • {nassauSummaryLabelsFromBreakdown?.front ?? nassau.front.label}
+                      </Text>
+                    </View>
+                    <View style={styles.legPill}>
+                      <Text style={styles.legPillText}>
+                        Back: {nassau.back.complete ? "✓" : "…"} • {nassauSummaryLabelsFromBreakdown?.back ?? nassau.back.label}
+                      </Text>
+                    </View>
+                    <View style={styles.legPill}>
+                      <Text style={styles.legPillText}>
+                        Overall: {nassau.overall.complete ? "✓" : "…"} • {nassauSummaryLabelsFromBreakdown?.overall ?? nassau.overall.label}
+                      </Text>
+                    </View>
+                  </View>
+                </>
+              )}
+
+              {/* FINAL SUMMARY (only at end) */}
+              {state.isComplete && state.rewards && (
+                <>
+                  <Text style={styles.cardHeader}>Final Summary</Text>
+
+                  <View style={{ marginTop: 8, gap: 10 }}>
+                    {state.players.map((p, i) => {
+                      const podium = state.rewards.podium?.[i] ?? 0;
+                      const nassauV = state.rewards.nassau?.[i] ?? 0;
+                      const streak = state.rewards.streak?.[i] ?? 0;
+                      const round = state.rewards.roundScore?.[i] ?? 0;
+                      const total = state.rewards.total?.[i] ?? 0;
+
+                      const showLegs =
+                        nassauLegBreakdown.enabled &&
+                        (nassauLegBreakdown.front.on ||
+                          nassauLegBreakdown.back.on ||
+                          nassauLegBreakdown.overall.on);
+
+                      const fPos = showLegs ? nassauLegBreakdown.front.pos[i] : { pos: 0, tied: false };
+                      const bPos = showLegs ? nassauLegBreakdown.back.pos[i] : { pos: 0, tied: false };
+                      const oPos = showLegs ? nassauLegBreakdown.overall.pos[i] : { pos: 0, tied: false };
+
+                      const fDelta = showLegs ? (nassauLegBreakdown.front.deltas[i] ?? 0) : 0;
+                      const bDelta = showLegs ? (nassauLegBreakdown.back.deltas[i] ?? 0) : 0;
+                      const oDelta = showLegs ? (nassauLegBreakdown.overall.deltas[i] ?? 0) : 0;
+
+                      return (
+                        <View key={i} style={{ paddingVertical: 6 }}>
+                          <Text style={{ fontWeight: "900" }}>{p.name}</Text>
+
+                          <View style={{ flexDirection: "row", flexWrap: "wrap", gap: 8, marginTop: 6 }}>
+                            <View style={styles.badge}>
+                              <Text style={[styles.badgeText, { color: colorFor(podium) }]}>
+                                Podium: {fmtReward(podium)}
+                              </Text>
+                            </View>
+
+                            <View style={styles.badge}>
+                              <Text style={[styles.badgeText, { color: colorFor(nassauV) }]}>
+                                Nassau: {fmtReward(nassauV)}
+                              </Text>
+                            </View>
+
+                            <View style={styles.badge}>
+                              <Text style={[styles.badgeText, { color: colorFor(streak) }]}>
+                                Eagle: {fmtReward(streak)}
+                              </Text>
+                            </View>
+
+                            <View style={styles.badge}>
+                              <Text style={[styles.badgeText, { color: colorFor(round) }]}>
+                                Round: {fmtReward(round)}
+                              </Text>
+                            </View>
+
+                            <View style={styles.badge}>
+                              <Text style={[styles.badgeText, { color: colorFor(total) }]}>
+                                Total: {fmtReward(total)}
+                              </Text>
+                            </View>
+                          </View>
+
+                          {showLegs && (
+                            <View style={{ marginTop: 8, flexDirection: "row", flexWrap: "wrap", gap: 8 }}>
+                              {nassauLegBreakdown.front.on && (
+                                <View style={styles.legMiniPill}>
+                                  <Text style={[styles.legMiniText, { color: colorFor(fDelta) }]}>
+                                    Front {posLabel(fPos)} • {fmtReward(fDelta)}
+                                  </Text>
+                                </View>
+                              )}
+
+                              {nassauLegBreakdown.back.on && (
+                                <View style={styles.legMiniPill}>
+                                  <Text style={[styles.legMiniText, { color: colorFor(bDelta) }]}>
+                                    Back {posLabel(bPos)} • {fmtReward(bDelta)}
+                                  </Text>
+                                </View>
+                              )}
+
+                              {nassauLegBreakdown.overall.on && (
+                                <View style={styles.legMiniPill}>
+                                  <Text style={[styles.legMiniText, { color: colorFor(oDelta) }]}>
+                                    Overall {posLabel(oPos)} • {fmtReward(oDelta)}
+                                  </Text>
+                                </View>
+                              )}
+                            </View>
+                          )}
+                        </View>
+                      );
+                    })}
+                  </View>
+                </>
+              )}
+              </ScrollView>
+            </View>
+          </View>
+        )}
+
+        <View style={{ flex: 1 }}>
+          {/* ✅ BIG HOLE WATERMARK (Scorecard overlay) */}
+{!state.isComplete && (
+  <View pointerEvents="none" style={styles.holeWatermarkWrap}>
+    <View style={styles.holeWatermarkPlayerRow}>
+      <Text
+        style={[
+          styles.holeWatermarkPlayer,
+          { fontSize: isLarge ? 220 : 52 },
+        ]}
+      >
+        {currentPlayer.name}
+      </Text>
+      <Text
+        style={[
+          styles.holeWatermarkPlayer,
+          { fontSize: isLarge ? 220 : 52, marginLeft: isLarge ? 40 : 24 },
+        ]}
+      >
+        {scoreLabel(
+          showFrontBackInTotalRow && front9DisplayTotals && back9DisplayTotals && currentPlayer.holeIndex >= 10
+            ? (front9DisplayTotals[state.currentPlayerIndex] ?? 0) + (back9DisplayTotals[state.currentPlayerIndex] ?? 0)
+            : currentPlayer.total + (showNetScore && placementHandicapsFromSetup?.[state.currentPlayerIndex] != null ? (placementHandicapsFromSetup[state.currentPlayerIndex] ?? 0) : 0)
+        )}
+        {showFrontBackInTotalRow && front9DisplayTotals && back9DisplayTotals && currentPlayer.holeIndex >= 10 && (() => {
+          const front = front9DisplayTotals[state.currentPlayerIndex] ?? 0;
+          const back = back9DisplayTotals[state.currentPlayerIndex] ?? 0;
+          return (
+            <> ({scoreLabel(front)}{back === 0 ? "+0" : scoreLabel(back)})</>
+          );
+        })()}
+      </Text>
+    </View>
+
+    <Text
+      style={[
+        styles.holeWatermarkText,
+        { fontSize: isLarge ? 500 : 160 },
+      ]}
+    >
+      {currentHole === "BULL" ? "Bull" : String(currentHole ?? "")}
+    </Text>
+  </View>
+)}
+
+          <View style={[styles.tableWrap, { padding: isLarge ? 22 : 12, flex: 1, minHeight: 0 }]}>
+            <ScrollView horizontal showsHorizontalScrollIndicator={false}>
+              <View>
+                {/* Header */}
+                <View style={[styles.tr, styles.th]}>
+                  <View style={[styles.cellHole, styles.cellHeader, { width: ui.holeW, padding: ui.cellPad }]}>
+                    <Text style={[styles.thText, { fontSize: ui.th }]}>Hole</Text>
+                  </View>
+
+                  {state.players.map((p, idx) => (
+                    <View
+                      key={idx}
+                      style={[
+                        styles.cell,
+                        styles.cellHeader,
+                        { width: ui.cellW, padding: ui.cellPad },
+                        idx === state.currentPlayerIndex && !state.isComplete ? styles.cellHeaderActive : null,
+                      ]}
+                    >
+                      <View style={styles.scorecardHeaderNameRow}>
+                        <Text
+                          style={[styles.thText, { fontSize: ui.th, flexShrink: 1 }]}
+                          numberOfLines={1}
+                          adjustsFontSizeToFit
+                          minimumFontScale={0.6}
+                        >
+                          {p.name}
+                        </Text>
+                        {placementHandicapsFromSetup != null && (
+                          <View style={styles.handicapPill}>
+                            <Text style={styles.handicapPillText}>
+                              {fmtSigned(placementHandicapsFromSetup[idx] ?? 0)}
+                            </Text>
+                          </View>
+                        )}
+                      </View>
+                    </View>
+                  ))}
+                </View>
+
+                {/* Holes list (vertical scroll) */}
+                <ScrollView
+                  ref={holesScrollRef}
+                  style={{ maxHeight: ui.holesMaxH }}
+                  onLayout={(e) => setHolesViewportH(e.nativeEvent.layout.height)}
+                  onContentSizeChange={(_, h) => setHolesContentH(h)}
+                  showsVerticalScrollIndicator
+                >
+                  {state.holes.map((h, holeIdx) => {
+                    const isFocusRow = holeIdx === currentPlayer.holeIndex && !state.isComplete;
+
+                    return (
+                      <View
+                        key={holeIdx}
+                        onLayout={(e) => {
+                          if (holeIdx === 0 && !holeRowH) setHoleRowH(e.nativeEvent.layout.height);
+                        }}
+                        style={[styles.tr, isFocusRow && styles.focusRow]}
+                      >
+                        <View style={[styles.cellHole, { width: ui.holeW, padding: ui.cellPad }]}>
+                          <Text style={[styles.tdText, { fontSize: isFocusRow ? ui.tdFocus : ui.td }]}>
+                            {holeLabel(h)}
+                          </Text>
+                        </View>
+
+                        {state.players.map((p, pIdx) => {
+                          const v = p.scores[holeIdx];
+                          const played = v !== null;
+
+                          const isCurrentCell =
+                            !state.isComplete &&
+                            pIdx === state.currentPlayerIndex &&
+                            holeIdx === state.players[pIdx].holeIndex;
+
+                          const mark = state.eagleRewardMark?.[pIdx]?.[holeIdx] ?? null;
+                          const isEagleStreak = mark === "EAGLE";
+                          const isEagleBonus = mark === "BONUS";
+                          const isEagleJackpot = mark === "JACKPOT";
+
+                          return (
+                            <View
+                              key={pIdx}
+                              style={[
+                                styles.cell,
+                                { width: ui.cellW, padding: ui.cellPad },
+                                isFocusRow && styles.focusCell,
+                                isCurrentCell && styles.cellActive,
+                                isEagleStreak && styles.eagleStreakCell,
+                                isEagleBonus && styles.eagleBonusCell,
+                                isEagleJackpot && styles.eagleJackpotCell,
+                              ]}
+                            >
+                              {!played ? (
+                                <Text
+                                  style={[
+                                    styles.tdText,
+                                    { fontSize: isFocusRow ? ui.tdFocus : ui.td, opacity: 0.35 },
+                                  ]}
+                                >
+                                  —
+                                </Text>
+                              ) : (() => {
+                                  const holeScore = v as number;
+                                  const runningTotal = totalUpTo(p.scores, holeIdx);
+                                  const netOffset =
+                                    showNetScore && placementHandicapsFromSetup?.[pIdx] != null
+                                      ? placementHandicapsFromSetup[pIdx]
+                                      : 0;
+                                  const shownNumber =
+                                    cellMode === "TOTAL" ? runningTotal + netOffset : holeScore;
+                                  const label = scoreNameForCell(holeScore);
+
+                                  return (
+                                    <View
+                                      style={{
+                                        flexDirection: "row",
+                                        alignItems: "center",
+                                        justifyContent: "flex-start",
+                                        width: "100%",
+                                        paddingHorizontal: 2,
+                                      }}
+                                    >
+                                      {!!label && (
+                                        <Text
+                                          style={[
+                                            styles.tdText,
+                                            { fontSize: (isFocusRow ? ui.tdFocus : ui.td) * 0.65, opacity: 0.7 },
+                                          ]}
+                                          numberOfLines={1}
+                                        >
+                                          {label}
+                                        </Text>
+                                      )}
+
+                                      <Text
+                                        style={[
+                                          styles.tdText,
+                                          {
+                                            fontSize: isFocusRow ? ui.tdFocus : ui.td,
+                                            fontWeight: "900",
+                                            marginLeft: "auto",
+                                            textAlign: "right",
+                                          },
+                                        ]}
+                                        numberOfLines={1}
+                                      >
+                                        {scoreLabel(shownNumber)}
+                                      </Text>
+                                    </View>
+                                  );
+                                })()}
+                            </View>
+                          );
+                        })}
+                      </View>
+                    );
+                  })}
+                </ScrollView>
+
+                {/* Total row */}
+                <View style={[styles.tr, styles.totalRow]}>
+                  <View style={[styles.cellHole, styles.cellHeader, { width: ui.holeW, padding: ui.cellPad }]}>
+                    <Text style={[styles.thText, { fontSize: ui.th }]}>Total</Text>
+                  </View>
+
+                  {state.players.map((p, idx) => {
+                    const front = showFrontBackInTotalRow && front9DisplayTotals ? (front9DisplayTotals[idx] ?? 0) : null;
+                    const back = showFrontBackInTotalRow && back9DisplayTotals ? (back9DisplayTotals[idx] ?? 0) : null;
+
+                    return (
+                      <View
+                        key={idx}
+                        style={[
+                          styles.cell,
+                          styles.cellHeader,
+                          {
+                            width: ui.cellW,
+                            padding: ui.cellPad,
+                            flexDirection: showFrontBackInTotalRow ? "row" : "column",
+                            justifyContent: showFrontBackInTotalRow ? "space-between" : "center",
+                            alignItems: "center",
+                          },
+                        ]}
+                      >
+                        {showFrontBackInTotalRow ? (
+                          <>
+                            <Text style={[styles.thText, { fontSize: ui.th }]} numberOfLines={1}>
+                              {scoreLabel(front as number)}
+                            </Text>
+                            <Text style={[styles.thText, { fontSize: ui.th, opacity: 0.85 }]} numberOfLines={1}>
+                              {scoreLabel(back as number)}
+                            </Text>
+                          </>
+                        ) : (
+                          <Text style={[styles.thText, { fontSize: ui.th }]} numberOfLines={1}>
+                            {scoreLabel(p.total)}
+                          </Text>
+                        )}
+                      </View>
+                    );
+                  })}
+                </View>
+                                              {/* Rewards row (same shape as Total row) */}
+{rewardsOn && (
+  <View style={[styles.tr, styles.totalRow, { marginTop: 10 }]}>
+    <View style={[styles.cellHole, styles.cellHeader, styles.rewardCell, { width: ui.holeW, padding: ui.cellPad }]}>
+      <Text style={[styles.thText, { fontSize: ui.th }]} numberOfLines={1}>
+        Rewards
+      </Text>
+    </View>
+
+    {state.players.map((_, idx) => {
+      const d = displayRewardsTotals[idx] ?? 0;
+      const label = fmtReward(d);
+
+      return (
+        <View
+          key={idx}
+          style={[
+            styles.cell,
+            styles.cellHeader,
+            styles.rewardCell,
+            {
+              width: ui.cellW,
+              padding: ui.cellPad,
+            },
+            flashPlayer === idx && styles.rewardPulseCell,
+          ]}
+        >
+          <Text
+            style={[
+              styles.thText,
+              { fontSize: ui.th },
+              flashPlayer === idx && styles.rewardPulseText,
+            ]}
+            numberOfLines={1}
+          >
+            {label}
+          </Text>
+        </View>
+      );
+    })}
+  </View>
+)}
+              </View>
+            </ScrollView>
+          </View>
+        </View>
+
+        <View
+          style={[
+            styles.bottomBar,
+            {
+              paddingBottom: (isLarge ? 18 : 12) + (Platform.OS === "ios" ? 8 : 0),
+            },
+          ]}
+        >
+          {viewedViaPeek ? (
+            <View style={{ width: "100%", alignSelf: "stretch" }}>
+              <Pressable
+                style={[
+                  styles.btnThrow,
+                  {
+                    paddingVertical: ui.btnPadV,
+                    width: "100%",
+                    borderRadius: 14,
+                    alignItems: "center",
+                    justifyContent: "center",
+                  },
+                ]}
+                onPress={() => {
+                  setViewedViaPeek(false);
+                  setMode("BOARD");
+                }}
+              >
+                <Text style={{ color: "white", fontWeight: "900", fontSize: ui.btnText }}>
+                  Back to Dartboard
+                </Text>
+              </Pressable>
+            </View>
+          ) : (
+            <View style={[styles.buttonsRow, styles.buttonsRowWithThrow]}>
+              <View style={[styles.buttonsRowLeft, { flex: rewardsOn ? 4 : 3 }]}>
+                {rewardsOn && (
+                  <Pressable
+                    style={[
+                      styles.btn,
+                      { paddingVertical: ui.btnPadV },
+                      !showRewardsCard && styles.btnGlow,
+                      showRewardsCard && styles.btnActive,
+                    ]}
+                    onPress={() => setShowRewardsCard((v) => !v)}
+                  >
+                    <Text style={[styles.btnText, { fontSize: ui.btnText }]}>Rewards</Text>
+                  </Pressable>
+                )}
+
+                <Pressable style={[styles.btn, { paddingVertical: ui.btnPadV }]} onPress={() => setState((s) => recomputeAllRewards(undo(s), playoffTotalsOverrides ?? undefined))}>
+                  <Text style={[styles.btnText, { fontSize: ui.btnText }]}>Undo</Text>
+                </Pressable>
+
+                <Pressable style={[styles.btn, { paddingVertical: ui.btnPadV }]} onPress={() => setState((s) => recomputeAllRewards(redo(s), playoffTotalsOverrides ?? undefined))}>
+                  <Text style={[styles.btnText, { fontSize: ui.btnText }]}>Redo</Text>
+                </Pressable>
+
+                <Pressable
+                  style={[styles.btn, { paddingVertical: ui.btnPadV }]}
+                  disabled={state.isComplete}
+                  onPress={() => {
+                    setState((s) => recomputeAllRewards(noScore(s), playoffTotalsOverrides ?? undefined));
+                  }}
+                >
+                  <Text style={[styles.btnText, { fontSize: ui.btnText }]}>No Score</Text>
+                </Pressable>
+              </View>
+
+              {!state.isComplete && (
+                <Pressable
+                  style={[styles.btn, styles.btnThrow, { paddingVertical: ui.btnPadV }]}
+                  onPress={() => {
+                    setViewedViaPeek(false);
+                    clearPending();
+                    setMode("BOARD");
+                  }}
+                >
+                  <Text style={[styles.btnText, { fontSize: ui.btnText }]}>Throw</Text>
+                </Pressable>
+              )}
+            </View>
+          )}
+        </View>
+      </View>
+    </SafeAreaView>
+  );
+
+}
+
+const styles = StyleSheet.create({
+  safe: { flex: 1, backgroundColor: "#F8FAFC" },
+  full: { flex: 1, backgroundColor: "#F8FAFC" },
+
+  topBar: {
+    paddingHorizontal: 16,
+    paddingTop: 16,
+    paddingBottom: 14,
+    borderBottomWidth: 1,
+    borderBottomColor: "#E5E7EB",
+    backgroundColor: "white",
+    justifyContent: "center",
+  },
+
+  autoOverlay: {
+    position: "absolute",
+    left: 0,
+    top: 0,
+    alignItems: "center",
+    justifyContent: "center",
+  },
+  autoOverlayText: {
+    color: "white",
+    fontWeight: "900",
+    fontSize: 64,
+    textShadowColor: "rgba(0,0,0,0.6)",
+    textShadowOffset: { width: 0, height: 3 },
+    textShadowRadius: 10,
+  },
+  closestOverlay: {
+    position: "absolute",
+    left: 0,
+    right: 0,
+    top: "12%",
+    alignItems: "center",
+  },
+  closestOverlayText: {
+    color: "white",
+    fontWeight: "900",
+    fontSize: 56,
+    textShadowColor: "rgba(0,0,0,0.7)",
+    textShadowOffset: { width: 0, height: 2 },
+    textShadowRadius: 8,
+  },
+  ctbMissOverlayWrap: {
+    alignItems: "center",
+    justifyContent: "center",
+  },
+  ctbMissOverlayText: {
+    color: "white",
+    fontWeight: "900",
+    fontSize: 72,
+    textShadowColor: "rgba(0,0,0,0.8)",
+    textShadowOffset: { width: 0, height: 2 },
+    textShadowRadius: 10,
+  },
+  ctbThrowOrderSetTitle: {
+    color: "white",
+    fontWeight: "900",
+    fontSize: 72,
+    textShadowColor: "rgba(0,0,0,0.8)",
+    textShadowOffset: { width: 0, height: 2 },
+    textShadowRadius: 10,
+  },
+  ctbThrowOrderSetSub: {
+    color: "rgba(255,255,255,0.9)",
+    fontWeight: "700",
+    fontSize: 28,
+    marginTop: 12,
+    textAlign: "center",
+    textShadowColor: "rgba(0,0,0,0.8)",
+    textShadowOffset: { width: 0, height: 2 },
+    textShadowRadius: 6,
+  },
+
+  autoDot: { width: 10, height: 10, borderRadius: 999 },
+  autoDotOn: { backgroundColor: "#16A34A" },
+  autoDotOff: { backgroundColor: "#9CA3AF" },
+
+  exitLink: {
+    paddingVertical: 8,
+    paddingHorizontal: 12,
+    borderRadius: 10,
+    backgroundColor: "white",
+    borderWidth: 1,
+    borderColor: "#E5E7EB",
+  },
+  exitLinkText: { color: "#111827", fontWeight: "800", fontSize: 15 },
+
+  title: { fontWeight: "800" },
+  sub: { opacity: 0.85, fontWeight: "700" },
+
+  center: { flex: 1, alignItems: "center", justifyContent: "center" },
+
+  bottomBar: {
+    paddingHorizontal: 12,
+    paddingTop: 12,
+    paddingBottom: 12,
+    borderTopWidth: 1,
+    borderTopColor: "#E5E7EB",
+    backgroundColor: "white",
+    gap: 12,
+  },
+
+  
+
+  buttonsRow: {
+    flexDirection: "row",
+    gap: 12,
+    justifyContent: "center",
+  },
+  buttonsRowWithThrow: { justifyContent: "space-between" },
+  buttonsRowLeft: { flexDirection: "row", gap: 12, flex: 1 },
+
+  buttonsRowBoard: {
+    flexDirection: "row",
+    gap: 12,
+    justifyContent: "center",
+  },
+
+  btn: {
+    flex: 1,
+    borderRadius: 14,
+    backgroundColor: "#2563EB",
+    alignItems: "center",
+    justifyContent: "center",
+  },
+  btnThrow: { backgroundColor: "#16A34A" },
+  btnBoard: {
+    flex: 1,
+    borderRadius: 14,
+    backgroundColor: "#2563EB",
+    alignItems: "center",
+    justifyContent: "center",
+  },
+
+  btnText: { color: "white", fontWeight: "900" },
+
+  btnDisabled: { opacity: 0.45 },
+
+  btnActive: { backgroundColor: "#0F172A" },
+
+  btnGlow: {
+    borderWidth: 2,
+    borderColor: "#0F9D58",
+    shadowColor: "#0F9D58",
+    shadowOpacity: 0.35,
+    shadowRadius: 10,
+    shadowOffset: { width: 0, height: 0 },
+    elevation: 6,
+  },
+
+  hint: { opacity: 0.65 },
+
+  dartsRow: { flexDirection: "row", gap: 10, justifyContent: "center", flexWrap: "wrap" },
+  dartPill: {
+    borderRadius: 999,
+    backgroundColor: "#F1F5F9",
+    borderWidth: 1,
+    borderColor: "#E2E8F0",
+    alignItems: "center",
+    justifyContent: "center",
+  },
+  dartPillText: { fontWeight: "900" },
+
+  tableWrap: { flex: 1 },
+  tr: { flexDirection: "row", marginBottom: 10 },
+  th: { marginBottom: 12 },
+
+  cellHole: {
+    borderRadius: 12,
+    backgroundColor: "white",
+    borderWidth: 1,
+    borderColor: "#E5E7EB",
+    marginRight: 10,
+    alignItems: "center",
+    justifyContent: "center",
+  },
+  cell: {
+    borderRadius: 12,
+    backgroundColor: "white",
+    borderWidth: 1,
+    borderColor: "#E5E7EB",
+    marginRight: 10,
+    alignItems: "center",
+    justifyContent: "center",
+  },
+
+  cellHeader: { backgroundColor: "#0F172A", borderColor: "#0F172A" },
+  cellHeaderActive: { borderColor: "#2563EB", borderWidth: 2 },
+
+  thText: { color: "white", fontWeight: "900" },
+  tdText: { fontWeight: "900" },
+
+  cellActive: { borderColor: "#2563EB", borderWidth: 2 },
+
+  totalRow: { marginTop: 10 },
+
+  rewardCell: {
+    paddingVertical: 14,
+    paddingHorizontal: 8,
+    minHeight: 48,
+    alignItems: "center",
+    justifyContent: "center",
+  },
+
+  rewardPulseCell: {
+    backgroundColor: "#0F9D58",
+    borderColor: "#0F9D58",
+    borderWidth: 2,
+  },
+  rewardPulseText: { color: "white" },
+
+  sideCard: {
+    backgroundColor: "white",
+    borderWidth: 1,
+    borderColor: "#E5E7EB",
+    borderRadius: 14,
+    padding: 12,
+  },
+
+  cardTitle: { fontWeight: "900", fontSize: 16 },
+  cardHeader: { marginTop: 10, fontWeight: "900", opacity: 0.9 },
+  cardSub: { opacity: 0.7, marginTop: 4 },
+
+  badgeRow: { flexDirection: "row", flexWrap: "wrap", gap: 8, marginTop: 8 },
+  badgeText: { fontWeight: "900" },
+  badge: {
+    paddingVertical: 7,
+    paddingHorizontal: 10,
+    borderRadius: 999,
+    backgroundColor: "#F1F5F9",
+    borderWidth: 1,
+    borderColor: "#E2E8F0",
+  },
+
+  scorecardHeaderNameRow: {
+    flexDirection: "row",
+    alignItems: "center",
+    flexWrap: "nowrap",
+    gap: 6,
+  },
+  handicapPill: {
+    paddingVertical: 3,
+    paddingHorizontal: 8,
+    borderRadius: 999,
+    backgroundColor: "#E0F2FE",
+    borderWidth: 1,
+    borderColor: "#0EA5E9",
+    flexShrink: 0,
+  },
+  handicapPillText: {
+    fontWeight: "800",
+    fontSize: 12,
+    color: "#0369A1",
+  },
+
+  legRow: { marginTop: 10, gap: 8, flexDirection: "row", flexWrap: "wrap" },
+  legPill: {
+    paddingVertical: 8,
+    paddingHorizontal: 10,
+    borderRadius: 999,
+    backgroundColor: "#EEF2FF",
+    borderWidth: 1,
+    borderColor: "#C7D2FE",
+  },
+  legPillText: { fontWeight: "900", color: "#1E3A8A" },
+
+  legMiniPill: {
+    paddingVertical: 6,
+    paddingHorizontal: 10,
+    borderRadius: 999,
+    backgroundColor: "#F8FAFC",
+    borderWidth: 1,
+    borderColor: "#E2E8F0",
+  },
+  legMiniText: { fontWeight: "900" },
+
+  twoColRow: { marginTop: 12, flexDirection: "row", gap: 12 },
+
+  autoResetBtn: {
+    paddingVertical: 6,
+    paddingHorizontal: 10,
+    borderRadius: 10,
+    backgroundColor: "#0F172A",
+  },
+  autoResetText: {
+    color: "white",
+    fontWeight: "900",
+    fontSize: 12,
+  },
+
+  holeWatermarkWrap: {
+  position: "absolute",
+  left: 0,
+  right: 0,
+  top: 0,
+  bottom: 0,
+  alignItems: "center",
+  justifyContent: "center",
+  zIndex: 1,
+},
+
+holeWatermarkText: {
+  fontWeight: "900",
+  color: "rgba(15, 23, 42, 0.10)", // very transparent dark
+  letterSpacing: 2,
+},
+
+holeWatermarkPlayerRow: {
+  flexDirection: "row",
+  justifyContent: "center",
+  alignItems: "center",
+  marginBottom: 10,
+},
+holeWatermarkPlayer: {
+  fontWeight: "900",
+  color: "rgba(0,0,0,0.12)",
+  textAlign: "center",
+},
+
+
+
+  autoRestartBtn: {
+    paddingVertical: 6,
+    paddingHorizontal: 10,
+    borderRadius: 10,
+    backgroundColor: "#0F172A",
+  },
+  autoRestartText: {
+    color: "white",
+    fontWeight: "900",
+    fontSize: 12,
+  },
+  autoBoardBtn: {
+    paddingVertical: 6,
+    paddingHorizontal: 10,
+    borderRadius: 10,
+    backgroundColor: "#0F172A",
+  },
+  autoBoardText: {
+    color: "white",
+    fontWeight: "900",
+    fontSize: 12,
+  },
+
+  autoRightGroup: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 8,
+  },
+
+  focusRow: { borderRadius: 12 },
+  focusCell: { backgroundColor: "#EEF2FF", borderColor: "#4b96b8" },
+
+  eagleStreakCell: {
+    backgroundColor: "#f1fff5",
+    borderColor: "#86c79e",
+    borderWidth: 2,
+  },
+
+  eagleBonusCell: {
+    backgroundColor: "#DCFCE7",
+    borderColor: "#22C55E",
+    borderWidth: 2,
+  },
+  eagleJackpotCell: {
+    backgroundColor: "#BBF7D0",
+    borderColor: "#16A34A",
+    borderWidth: 2,
+  },
+});
